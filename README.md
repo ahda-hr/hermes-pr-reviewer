@@ -36,7 +36,7 @@ cd hermes-pr-reviewer
 python scripts/setup.py
 ```
 
-The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It creates a `reviewer` Hermes profile, configures its group-output-only behavior, creates `/pr-review`, and creates weekday schedules at 05:00 and 15:30 in the machine's local timezone.
+The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It creates a `reviewer` Hermes profile, configures its group-output-only behavior, creates `/pr-review`, and creates weekday schedules at 05:00 and 15:30 in the machine's local timezone. Override those defaults with `--morning-cron` and `--afternoon-cron`.
 
 The token is saved only in the local Hermes profile `.env`; it is never written to this repository. Authenticate GitHub separately after setup:
 

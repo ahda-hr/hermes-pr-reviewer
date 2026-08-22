@@ -47,7 +47,8 @@ def update_env(path: Path, updates: dict[str, str]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="reviewer")
-    parser.add_argument("--timezone", default="Asia/Jakarta")
+    parser.add_argument("--morning-cron", default="0 5 * * 1-5", help="Hermes cron expression for the first weekday run")
+    parser.add_argument("--afternoon-cron", default="30 15 * * 1-5", help="Hermes cron expression for the second weekday run")
     parser.add_argument("--skip-schedules", action="store_true")
     args = parser.parse_args()
     missing = [name for name in ("git", "gh", "codex", "hermes") if shutil.which(name) is None]
@@ -87,7 +88,7 @@ def main() -> int:
     wrapper.write_text(f'#!/usr/bin/env python3\nimport subprocess\nsubprocess.run([{sys.executable!r}, {str(ROOT / "scripts" / "start_pr_review.py")!r}, "--trigger", "scheduled"], check=True)\n', encoding="utf-8")
     if not args.skip_schedules:
         existing = subprocess.run(["hermes", "-p", args.profile, "cron", "list"], capture_output=True, text=True).stdout
-        for name, schedule in (("PR review 05:00", "0 5 * * 1-5"), ("PR review 15:30", "30 15 * * 1-5")):
+        for name, schedule in (("PR review morning", args.morning_cron), ("PR review afternoon", args.afternoon_cron)):
             if name not in existing:
                 run(["hermes", "-p", args.profile, "cron", "create", "--name", name, "--cron", schedule, "--script", wrapper.name, "--no-agent", "--deliver", "local"])
     run(["hermes", "-p", args.profile, "gateway", "restart"])
