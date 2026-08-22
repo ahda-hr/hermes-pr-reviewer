@@ -78,7 +78,7 @@ python scripts/run_pr_reviews.py --trigger terminal --repo OWNER/REPOSITORY
 
 In the reviewer bot's private chat, send `/pr-review`. It starts a detached process; a second request while a review is active reports that it was not started. The bot may still perform other tasks in direct messages. It does not handle group requests.
 
-Each report is named `<repo-slug>__<pr-number>__<pr-author>.md` and includes source/target details, start/end/total time, critical and important issues, plus ternary, extraction, and anti-pattern refactor suggestions.
+Each report is named `<repo-slug>__<pr-number>__<pr-author>.md` and includes source/target details, start/end/total time, plus 🔴 blocking, 🟡 important, and 🟢 refactor-suggestion sections. Every finding includes file/line evidence, a suggested fix, and a plain-language copyable PR reply.
 
 ## Security and publication
 

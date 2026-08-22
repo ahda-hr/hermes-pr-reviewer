@@ -38,6 +38,13 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "{{unknown}}"):
             runner.render_review_prompt("{{unknown}}", 42, "refs/pr/42/base", [])
 
+    def test_shared_review_template_declares_report_shape(self):
+        template = runner.load_review_template()
+        self.assertIn("## 🔴 Blocking issues", template)
+        self.assertIn("## 🟡 Important issues", template)
+        self.assertIn("## 🟢 Ternary refactor suggestions", template)
+        self.assertIn("**Copyable suggested reply:**", template)
+
     def test_configured_skills_are_unique(self):
         self.assertEqual(runner.configured_skill_names({"codexSkills": ["review", "review", "security"]}), ["review", "security"])
 
