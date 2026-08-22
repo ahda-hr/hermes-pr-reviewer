@@ -36,7 +36,7 @@ cd hermes-pr-reviewer
 python scripts/setup.py
 ```
 
-The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It then asks once whether schedules should run on `weekdays` or `every day`, asks for a 24-hour time such as `05:00` or `15:30`, and asks whether to add another time. Each entered time creates a separate Hermes schedule in the machine's local timezone.
+The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It lists user-installed Codex skills and lets you select skills to request for every PR review. It then asks once whether schedules should run on `weekdays` or `every day`, asks for a 24-hour time such as `05:00` or `15:30`, and asks whether to add another time. Each entered time creates a separate Hermes schedule in the machine's local timezone.
 
 The token is saved only in the local Hermes profile `.env`; it is never written to this repository. Authenticate GitHub separately after setup:
 
@@ -55,6 +55,12 @@ Edit the local `config.json` (created from `config.example.json`) to choose repo
 ```
 
 Set `clearProxyEnvironment` to `true` only when inherited proxy variables point to an unavailable local proxy.
+
+## Review prompt and Codex skills
+
+Edit [`prompts/pr-review.md`](prompts/pr-review.md) to adjust the shared review instruction. It supports `{{pr_number}}`, `{{base_ref}}`, and `{{selected_skills}}`; all three are filled for every PR.
+
+The setup selector only lists local folders with a `SKILL.md` file in `$CODEX_HOME/skills` (or `~/.codex/skills`) and excludes internal `.system` skills. The selected names are saved in local `config.json` as `codexSkills`; no skill files are copied into this repository. If a selected skill is missing later, the runner warns and continues with installed selections.
 
 ## Use
 

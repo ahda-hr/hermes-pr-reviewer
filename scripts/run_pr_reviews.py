@@ -18,6 +18,8 @@ from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parent.parent
 PROXY_NAMES = ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY")
+PROMPT_TEMPLATE_PATH = ROOT / "prompts" / "pr-review.md"
+PLACEHOLDER_PATTERN = re.compile(r"{{[^{}]+}}")
 
 
 class CommandError(RuntimeError):
@@ -95,6 +97,45 @@ def require_tools() -> None:
     missing = [tool for tool in ("git", "gh", "codex", "hermes") if shutil.which(tool) is None]
     if missing:
         raise RuntimeError(f"Required command(s) not found on PATH: {', '.join(missing)}")
+
+
+def codex_skills_root() -> Path:
+    configured_home = os.environ.get("CODEX_HOME")
+    return Path(configured_home) / "skills" if configured_home else Path.home() / ".codex" / "skills"
+
+
+def installed_skill_names() -> list[str]:
+    root = codex_skills_root()
+    if not root.is_dir():
+        return []
+    return sorted(child.name for child in root.iterdir() if child.is_dir() and child.name != ".system" and (child / "SKILL.md").is_file())
+
+
+def configured_skill_names(config: dict[str, Any]) -> list[str]:
+    configured = config.get("codexSkills", [])
+    if not isinstance(configured, list) or any(not isinstance(name, str) or not name.strip() for name in configured):
+        raise RuntimeError("config.codexSkills must be an array of non-empty skill names.")
+    return list(dict.fromkeys(name.strip() for name in configured))
+
+
+def load_review_template() -> str:
+    if not PROMPT_TEMPLATE_PATH.is_file():
+        raise RuntimeError(f"Missing PR review prompt template: {PROMPT_TEMPLATE_PATH}")
+    return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+def render_review_prompt(template: str, pr_number: int, base_ref: str, skills: list[str]) -> str:
+    skill_instruction = (
+        "Use these installed Codex skills as part of this review: " + ", ".join(f"${name}" for name in skills) + "."
+        if skills else "No additional Codex skills were selected for this review."
+    )
+    prompt = (template.replace("{{pr_number}}", str(pr_number))
+            .replace("{{base_ref}}", base_ref)
+            .replace("{{selected_skills}}", skill_instruction))
+    unresolved = PLACEHOLDER_PATTERN.findall(prompt)
+    if unresolved:
+        raise RuntimeError("Unresolved placeholder(s) in PR review template: " + ", ".join(unresolved))
+    return prompt
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -176,6 +217,13 @@ def main() -> int:
     try:
         require_tools()
         clear_proxy_environment = config.get("clearProxyEnvironment") is True
+        configured_skills = configured_skill_names(config)
+        available_skills = set(installed_skill_names())
+        selected_skills = [name for name in configured_skills if name in available_skills]
+        missing_skills = [name for name in configured_skills if name not in available_skills]
+        if missing_skills:
+            send("Warning: configured Codex skill(s) not installed; continuing without them: " + ", ".join(missing_skills))
+        prompt_template = load_review_template()
         try:
             login = command(["gh", "api", "user", "--jq", ".login"], clear_proxy_environment=clear_proxy_environment).strip()
         except CommandError as error:
@@ -230,7 +278,7 @@ def main() -> int:
                         continue
                     command(["git", f"--git-dir={bare}", "worktree", "add", "--detach", str(worktree), f"refs/pr/{number}/head"], clear_proxy_environment=clear_proxy_environment)
                     send(f"[STARTED] {repository} PR #{number} by {author} ({pr['headRefName']} -> {pr['baseRefName']})")
-                    prompt = f"Review GitHub pull request #{number} in this worktree. Compare current HEAD against refs/pr/{number}/base. Return Markdown containing ONLY these sections: Critical issues, Important issues, Ternary refactor suggestions, Extraction refactor suggestions, Anti-pattern refactor suggestions. Cite repository-relative file paths and line numbers. Be precise; use None found for an empty section. Do not modify files."
+                    prompt = render_review_prompt(prompt_template, number, f"refs/pr/{number}/base", selected_skills)
                     codex_args = ["codex", "exec", "-C", str(worktree), "--sandbox", "read-only", "--output-last-message", str(raw_path)]
                     if config.get("codexModel"):
                         codex_args.extend(["--model", str(config["codexModel"])])

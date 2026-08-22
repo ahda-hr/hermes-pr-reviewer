@@ -28,6 +28,19 @@ class RunnerTests(unittest.TestCase):
         else:
             os.environ["HTTP_PROXY"] = original
 
+    def test_review_prompt_renders_selected_skills(self):
+        template = "PR {{pr_number}} base {{base_ref}}\n{{selected_skills}}"
+        prompt = runner.render_review_prompt(template, 42, "refs/pr/42/base", ["review", "security"])
+        self.assertIn("PR 42 base refs/pr/42/base", prompt)
+        self.assertIn("$review, $security", prompt)
+
+    def test_review_prompt_rejects_unknown_placeholders(self):
+        with self.assertRaisesRegex(RuntimeError, "{{unknown}}"):
+            runner.render_review_prompt("{{unknown}}", 42, "refs/pr/42/base", [])
+
+    def test_configured_skills_are_unique(self):
+        self.assertEqual(runner.configured_skill_names({"codexSkills": ["review", "review", "security"]}), ["review", "security"])
+
     @unittest.skipIf(os.name == "nt", "Windows file-lock integration is covered by the manual launcher test")
     def test_second_lock_is_rejected(self):
         temporary_root = Path(__file__).parent / ".tmp"

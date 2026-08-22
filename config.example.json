@@ -10,5 +10,6 @@
   "telegramTarget": "telegram",
   "hermesProfile": "reviewer",
   "clearProxyEnvironment": false,
+  "codexSkills": [],
   "codexModel": null
 }

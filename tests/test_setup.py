@@ -36,3 +36,7 @@ class SetupTests(unittest.TestCase):
                     ("PR review every day 15:30", "30 15 * * *", "15:30"),
                 ],
             )
+
+    def test_skill_selection_deduplicates_numbers(self):
+        with patch.object(setup, "ask", return_value="2,1,2"):
+            self.assertEqual(setup.select_codex_skills(["review", "security"]), ["security", "review"])

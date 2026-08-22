@@ -33,6 +33,40 @@ def hermes_data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "hermes"
 
 
+def codex_skills_root() -> Path:
+    configured_home = os.environ.get("CODEX_HOME")
+    return Path(configured_home) / "skills" if configured_home else Path.home() / ".codex" / "skills"
+
+
+def installed_skill_names() -> list[str]:
+    root = codex_skills_root()
+    if not root.is_dir():
+        return []
+    return sorted(child.name for child in root.iterdir() if child.is_dir() and child.name != ".system" and (child / "SKILL.md").is_file())
+
+
+def select_codex_skills(skills: list[str]) -> list[str]:
+    if not skills:
+        print("No user-installed Codex skills were found; continuing without additional skills.")
+        return []
+    print("Available user-installed Codex skills:")
+    for index, skill in enumerate(skills, start=1):
+        print(f"  {index}. {skill}")
+    while True:
+        selection = ask("Skill numbers to use for every PR review (comma-separated; blank for none)")
+        if not selection:
+            return []
+        try:
+            indexes = [int(value.strip()) for value in selection.split(",")]
+        except ValueError:
+            print("Enter comma-separated numbers from the list, or leave blank.")
+            continue
+        if not indexes or any(index < 1 or index > len(skills) for index in indexes):
+            print("Each skill number must be from the displayed list.")
+            continue
+        return [skills[index - 1] for index in dict.fromkeys(indexes)]
+
+
 def update_env(path: Path, updates: dict[str, str]) -> None:
     existing: dict[str, str] = {}
     if path.exists():
@@ -43,6 +77,14 @@ def update_env(path: Path, updates: dict[str, str]) -> None:
     existing.update(updates)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(f"{key}={value}\n" for key, value in existing.items()), encoding="utf-8")
+
+
+def update_config(path: Path, codex_skills: list[str]) -> None:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected an object in {path}")
+    data["codexSkills"] = codex_skills
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def validate_time(value: str) -> str:
@@ -106,6 +148,7 @@ def main() -> int:
     group_id = ask("Telegram review group ID")
     if not token or not user_id or not group_id:
         raise RuntimeError("Bot token, Telegram user ID, and group ID are required.")
+    update_config(config_path, select_codex_skills(installed_skill_names()))
     try:
         run(["hermes", "profile", "create", args.profile])
     except RuntimeError:
