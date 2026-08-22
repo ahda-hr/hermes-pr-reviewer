@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,11 +45,53 @@ def update_env(path: Path, updates: dict[str, str]) -> None:
     path.write_text("".join(f"{key}={value}\n" for key, value in existing.items()), encoding="utf-8")
 
 
+def validate_time(value: str) -> str:
+    """Return a zero-padded 24-hour time or raise ValueError."""
+    try:
+        return datetime.strptime(value, "%H:%M").strftime("%H:%M")
+    except ValueError as error:
+        raise ValueError("Enter a time in 24-hour HH:MM format, for example 05:00 or 15:30.") from error
+
+
+def cron_for(time_of_day: str, cadence: str) -> str:
+    hour, minute = validate_time(time_of_day).split(":")
+    if cadence == "weekdays":
+        return f"{int(minute)} {int(hour)} * * 1-5"
+    if cadence == "every day":
+        return f"{int(minute)} {int(hour)} * * *"
+    raise ValueError(f"Unsupported cadence: {cadence}")
+
+
+def collect_schedules() -> list[tuple[str, str, str]]:
+    while True:
+        cadence = ask("Run days (weekdays/every day)", "weekdays").lower()
+        if cadence in ("weekdays", "every day"):
+            break
+        print("Choose either 'weekdays' or 'every day'.")
+    schedules: list[tuple[str, str, str]] = []
+    while True:
+        try:
+            time_of_day = validate_time(ask("Review time (HH:MM)"))
+        except ValueError as error:
+            print(error)
+            continue
+        name = f"PR review {cadence} {time_of_day}"
+        if any(existing[0] == name for existing in schedules):
+            print(f"{time_of_day} is already included.")
+        else:
+            schedules.append((name, cron_for(time_of_day, cadence), time_of_day))
+        while True:
+            more = ask("Add another review time? (yes/no)", "no").lower()
+            if more in ("yes", "y", "no", "n"):
+                break
+            print("Answer yes or no.")
+        if more in ("no", "n"):
+            return schedules
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="reviewer")
-    parser.add_argument("--morning-cron", default="0 5 * * 1-5", help="Hermes cron expression for the first weekday run")
-    parser.add_argument("--afternoon-cron", default="30 15 * * 1-5", help="Hermes cron expression for the second weekday run")
     parser.add_argument("--skip-schedules", action="store_true")
     args = parser.parse_args()
     missing = [name for name in ("git", "gh", "codex", "hermes") if shutil.which(name) is None]
@@ -87,8 +130,9 @@ def main() -> int:
     wrapper = profile_scripts / "pr-review-launcher.py"
     wrapper.write_text(f'#!/usr/bin/env python3\nimport subprocess\nsubprocess.run([{sys.executable!r}, {str(ROOT / "scripts" / "start_pr_review.py")!r}, "--trigger", "scheduled"], check=True)\n', encoding="utf-8")
     if not args.skip_schedules:
+        schedules = collect_schedules()
         existing = subprocess.run(["hermes", "-p", args.profile, "cron", "list"], capture_output=True, text=True).stdout
-        for name, schedule in (("PR review morning", args.morning_cron), ("PR review afternoon", args.afternoon_cron)):
+        for name, schedule, _ in schedules:
             if name not in existing:
                 run(["hermes", "-p", args.profile, "cron", "create", "--name", name, "--cron", schedule, "--script", wrapper.name, "--no-agent", "--deliver", "local"])
     run(["hermes", "-p", args.profile, "gateway", "restart"])

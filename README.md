@@ -31,12 +31,12 @@ sudo pacman -Syu --needed git github-cli
 Clone the repository anywhere you want; all data directories are relative to that clone.
 
 ```bash
-git clone https://github.com/YOUR_ACCOUNT/hermes-pr-reviewer.git
+git clone https://github.com/ahda-hr/hermes-pr-reviewer.git
 cd hermes-pr-reviewer
 python scripts/setup.py
 ```
 
-The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It creates a `reviewer` Hermes profile, configures its group-output-only behavior, creates `/pr-review`, and creates weekday schedules at 05:00 and 15:30 in the machine's local timezone. Override those defaults with `--morning-cron` and `--afternoon-cron`.
+The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It then asks once whether schedules should run on `weekdays` or `every day`, asks for a 24-hour time such as `05:00` or `15:30`, and asks whether to add another time. Each entered time creates a separate Hermes schedule in the machine's local timezone.
 
 The token is saved only in the local Hermes profile `.env`; it is never written to this repository. Authenticate GitHub separately after setup:
 
