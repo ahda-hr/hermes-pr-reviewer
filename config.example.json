@@ -1,0 +1,14 @@
+{
+  "repos": [
+    {
+      "repo": "OWNER/REPOSITORY",
+      "slug": "repository",
+      "enabled": true
+    }
+  ],
+  "maxPrsPerRun": 10,
+  "telegramTarget": "telegram",
+  "hermesProfile": "reviewer",
+  "clearProxyEnvironment": false,
+  "codexModel": null
+}

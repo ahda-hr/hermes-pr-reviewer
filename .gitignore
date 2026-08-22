@@ -1,0 +1,10 @@
+config.json
+.setup-state.json
+cache/
+worktrees/
+reports/
+*.log
+.env
+__pycache__/
+tests/__pycache__/
+tests/.tmp/
