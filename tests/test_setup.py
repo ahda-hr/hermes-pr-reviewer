@@ -40,3 +40,20 @@ class SetupTests(unittest.TestCase):
     def test_skill_selection_deduplicates_numbers(self):
         with patch.object(setup, "ask", return_value="2,1,2"):
             self.assertEqual(setup.select_codex_skills(["review", "security"]), ["security", "review"])
+
+    def test_managed_cron_block_contains_scheduled_runner_and_log(self):
+        block = setup.managed_cron_block([("PR review weekdays 05:00", "0 5 * * 1-5", "05:00")])
+        self.assertIn(setup.CRON_BEGIN, block)
+        self.assertIn("0 5 * * 1-5", block)
+        self.assertIn("--trigger scheduled", block)
+        self.assertIn("scheduled-run.log", block)
+        self.assertIn(setup.CRON_END, block)
+
+    def test_managed_cron_block_replacement_preserves_unrelated_entries(self):
+        existing = "MAILTO=me@example.test\n" + setup.managed_cron_block([("old", "0 1 * * *", "01:00")]) + "0 2 * * * /other-job\n"
+        remaining = setup.remove_managed_cron_block(existing)
+        self.assertEqual(remaining, "MAILTO=me@example.test\n0 2 * * * /other-job")
+
+    def test_extract_hermes_job_id(self):
+        self.assertEqual(setup.extract_hermes_job_id("Created job: job-456"), "job-456")
+        self.assertEqual(setup.extract_hermes_job_id("Created cron job ID: job-123"), "job-123")

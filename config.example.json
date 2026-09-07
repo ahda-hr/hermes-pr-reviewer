@@ -7,8 +7,9 @@
     }
   ],
   "maxPrsPerRun": 10,
-  "telegramTarget": "telegram",
-  "hermesProfile": "reviewer",
+  "notifications": {
+    "provider": "terminal"
+  },
   "clearProxyEnvironment": false,
   "codexSkills": [],
   "codexModel": null

@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Interactive local setup for the Hermes PR reviewer. Never performs gh login."""
+"""Interactive local setup for the optional-Hermes PR reviewer. Never performs gh login."""
 from __future__ import annotations
 
 import argparse
 import getpass
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+SETUP_STATE_PATH = ROOT / ".setup-state.json"
+CRON_BEGIN = "# BEGIN hermes-pr-reviewer"
+CRON_END = "# END hermes-pr-reviewer"
 
 
 def ask(label: str, default: str | None = None, secret: bool = False) -> str:
@@ -21,16 +27,40 @@ def ask(label: str, default: str | None = None, secret: bool = False) -> str:
     return value or (default or "")
 
 
-def run(arguments: list[str]) -> None:
-    result = subprocess.run(arguments)
+def ask_yes_no(label: str, default: str = "no") -> bool:
+    while True:
+        value = ask(label, default).lower()
+        if value in ("yes", "y"):
+            return True
+        if value in ("no", "n"):
+            return False
+        print("Answer yes or no.")
+
+
+def run(arguments: list[str], *, capture_output: bool = False) -> str:
+    result = subprocess.run(arguments, capture_output=capture_output, text=True)
     if result.returncode:
-        raise RuntimeError(f"Command failed: {' '.join(arguments)}")
+        message = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Command failed: {' '.join(arguments)}" + (f"\n{message}" if message else ""))
+    return result.stdout if capture_output else ""
 
 
-def hermes_data_dir() -> Path:
-    if os.name == "nt":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "hermes"
-    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "hermes"
+def require_commands(names: tuple[str, ...]) -> None:
+    missing = [name for name in names if shutil.which(name) is None]
+    if missing:
+        raise RuntimeError(f"Install these commands first: {', '.join(missing)}")
+
+
+def hermes_root() -> Path:
+    configured_home = os.environ.get("HERMES_HOME", "").strip()
+    if not configured_home:
+        return Path.home() / ".hermes"
+    home = Path(configured_home)
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def hermes_profile_dir(profile: str) -> Path:
+    return hermes_root() / "profiles" / profile
 
 
 def codex_skills_root() -> Path:
@@ -67,6 +97,14 @@ def select_codex_skills(skills: list[str]) -> list[str]:
         return [skills[index - 1] for index in dict.fromkeys(indexes)]
 
 
+def select_notification_provider() -> str:
+    while True:
+        provider = ask("Notification mode (terminal/hermes)", "terminal").lower()
+        if provider in ("terminal", "hermes"):
+            return provider
+        print("Choose either 'terminal' or 'hermes'.")
+
+
 def update_env(path: Path, updates: dict[str, str]) -> None:
     existing: dict[str, str] = {}
     if path.exists():
@@ -79,16 +117,34 @@ def update_env(path: Path, updates: dict[str, str]) -> None:
     path.write_text("".join(f"{key}={value}\n" for key, value in existing.items()), encoding="utf-8")
 
 
-def update_config(path: Path, codex_skills: list[str]) -> None:
+def update_config(path: Path, codex_skills: list[str], notifications: dict[str, Any]) -> None:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict):
         raise RuntimeError(f"Expected an object in {path}")
+    data.pop("hermesProfile", None)
+    data.pop("telegramTarget", None)
     data["codexSkills"] = codex_skills
+    data["notifications"] = notifications
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def load_setup_state() -> dict[str, Any]:
+    if not SETUP_STATE_PATH.exists():
+        return {}
+    try:
+        state = json.loads(SETUP_STATE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Invalid setup state: {error}") from error
+    if not isinstance(state, dict):
+        raise RuntimeError("Setup state must be an object.")
+    return state
+
+
+def save_setup_state(state: dict[str, Any]) -> None:
+    SETUP_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
 def validate_time(value: str) -> str:
-    """Return a zero-padded 24-hour time or raise ValueError."""
     try:
         return datetime.strptime(value, "%H:%M").strftime("%H:%M")
     except ValueError as error:
@@ -122,13 +178,139 @@ def collect_schedules() -> list[tuple[str, str, str]]:
             print(f"{time_of_day} is already included.")
         else:
             schedules.append((name, cron_for(time_of_day, cadence), time_of_day))
-        while True:
-            more = ask("Add another review time? (yes/no)", "no").lower()
-            if more in ("yes", "y", "no", "n"):
-                break
-            print("Answer yes or no.")
-        if more in ("no", "n"):
+        if not ask_yes_no("Add another review time? (yes/no)"):
             return schedules
+
+
+def managed_cron_block(schedules: list[tuple[str, str, str]]) -> str:
+    if not schedules:
+        return ""
+    command = " ".join((
+        shlex.quote(sys.executable),
+        shlex.quote(str(ROOT / "scripts" / "start_pr_review.py")),
+        "--trigger scheduled",
+        f">> {shlex.quote(str(ROOT / 'cache' / 'scheduled-run.log'))} 2>&1",
+    ))
+    lines = [CRON_BEGIN]
+    lines.extend(f"{schedule} {command}" for _, schedule, _ in schedules)
+    lines.append(CRON_END)
+    return "\n".join(lines) + "\n"
+
+
+def remove_managed_cron_block(crontab: str) -> str:
+    pattern = re.compile(rf"(?ms)^{re.escape(CRON_BEGIN)}\n.*?^{re.escape(CRON_END)}\n?")
+    return pattern.sub("", crontab).strip()
+
+
+def replace_linux_cron(schedules: list[tuple[str, str, str]]) -> None:
+    if os.name == "nt":
+        raise RuntimeError("Native schedules are supported on Linux only. Use Task Scheduler manually on Windows.")
+    require_commands(("crontab",))
+    (ROOT / "cache").mkdir(parents=True, exist_ok=True)
+    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if current.returncode == 0:
+        existing = current.stdout
+    elif "no crontab" in (current.stderr or "").lower():
+        existing = ""
+    else:
+        raise RuntimeError((current.stderr or current.stdout).strip() or "Could not read crontab.")
+    updated = remove_managed_cron_block(existing)
+    block = managed_cron_block(schedules)
+    if updated and block:
+        updated += "\n"
+    updated += block
+    result = subprocess.run(["crontab", "-"], input=(updated + "\n") if updated else "", text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip() or "Could not update crontab.")
+
+
+def extract_hermes_job_id(output: str) -> str:
+    for pattern in (
+        r"(?im)\bcreated\s+job\s*:\s*([A-Za-z0-9_-]+)",
+        r"(?im)\b(?:job\s+)?id\s*[:=]\s*([A-Za-z0-9_-]+)",
+        r"(?im)\bcreated\b.*?\b([0-9a-f]{8}-[0-9a-f-]{27,})\b",
+    ):
+        match = re.search(pattern, output)
+        if match:
+            return match.group(1)
+    raise RuntimeError("Hermes created a schedule but did not report its job ID; remove it manually before retrying setup.")
+
+
+def remove_hermes_schedules(profile: str, state: dict[str, Any]) -> None:
+    jobs = state.get("hermesCronJobs", [])
+    if not isinstance(jobs, list):
+        raise RuntimeError("Setup state hermesCronJobs must be an array.")
+    previous_profile = state.get("hermesCronProfile", profile)
+    if not isinstance(previous_profile, str) or not previous_profile:
+        raise RuntimeError("Setup state hermesCronProfile must be a non-empty string.")
+    for job_id in jobs:
+        if isinstance(job_id, str) and job_id:
+            try:
+                run(["hermes", "-p", previous_profile, "cron", "remove", job_id])
+            except RuntimeError as error:
+                if "not found" not in str(error).lower():
+                    raise
+    state["hermesCronJobs"] = []
+    state.pop("hermesCronProfile", None)
+    save_setup_state(state)
+
+
+def create_hermes_schedules(profile: str, wrapper: Path, schedules: list[tuple[str, str, str]], state: dict[str, Any]) -> None:
+    created: list[str] = []
+    try:
+        for name, schedule, _ in schedules:
+            output = run([
+                "hermes", "-p", profile, "cron", "create", schedule,
+                "--name", name, "--script", wrapper.name, "--no-agent", "--deliver", "local",
+            ], capture_output=True)
+            created.append(extract_hermes_job_id(output))
+    except Exception:
+        for job_id in created:
+            try:
+                run(["hermes", "-p", profile, "cron", "remove", job_id])
+            except RuntimeError:
+                pass
+        raise
+    state["hermesCronJobs"] = created
+    state["hermesCronProfile"] = profile
+    save_setup_state(state)
+
+
+def configure_hermes(profile: str) -> None:
+    token = ask("Telegram bot token", secret=True)
+    user_id = ask("Your Telegram user ID")
+    group_id = ask("Telegram review group ID")
+    if not token or not user_id or not group_id:
+        raise RuntimeError("Bot token, Telegram user ID, and group ID are required.")
+    try:
+        run(["hermes", "profile", "create", profile])
+    except RuntimeError:
+        run(["hermes", "profile", "show", profile])
+    profile_dir = hermes_profile_dir(profile)
+    update_env(profile_dir / ".env", {
+        "TELEGRAM_BOT_TOKEN": token,
+        "TELEGRAM_ALLOWED_USERS": user_id,
+        "TELEGRAM_HOME_CHANNEL": group_id,
+    })
+    quick_command = f'{sys.executable} "{ROOT / "scripts" / "start_pr_review.py"}" --trigger hermes --detach'
+    run(["hermes", "-p", profile, "config", "set", "telegram.allowed_chats", json.dumps([user_id])])
+    run(["hermes", "-p", profile, "config", "set", "telegram.require_mention", "true"])
+    run(["hermes", "-p", profile, "config", "set", "telegram.exclusive_bot_mentions", "true"])
+    run(["hermes", "-p", profile, "config", "set", "telegram.guest_mode", "false"])
+    run(["hermes", "-p", profile, "config", "set", "display.background_process_notifications", "off"])
+    run(["hermes", "-p", profile, "config", "set", "quick_commands.pr-review.type", "exec"])
+    run(["hermes", "-p", profile, "config", "set", "quick_commands.pr-review.command", quick_command])
+
+
+def hermes_wrapper(profile: str) -> Path:
+    profile_scripts = hermes_profile_dir(profile) / "scripts"
+    profile_scripts.mkdir(parents=True, exist_ok=True)
+    wrapper = profile_scripts / "pr-review-launcher.py"
+    wrapper.write_text(
+        f'#!/usr/bin/env python3\nimport subprocess\nsubprocess.run([{sys.executable!r}, {str(ROOT / "scripts" / "start_pr_review.py")!r}, "--trigger", "scheduled"], check=True)\n',
+        encoding="utf-8",
+    )
+    return wrapper
 
 
 def main() -> int:
@@ -136,50 +318,31 @@ def main() -> int:
     parser.add_argument("--profile", default="reviewer")
     parser.add_argument("--skip-schedules", action="store_true")
     args = parser.parse_args()
-    missing = [name for name in ("git", "gh", "codex", "hermes") if shutil.which(name) is None]
-    if missing:
-        raise RuntimeError(f"Install these commands first: {', '.join(missing)}")
+    require_commands(("git", "gh", "codex"))
     config_path = ROOT / "config.json"
     if not config_path.exists():
         shutil.copyfile(ROOT / "config.example.json", config_path)
         print(f"Created {config_path}; edit its repository list before your first review.")
-    token = ask("Telegram bot token", secret=True)
-    user_id = ask("Your Telegram user ID")
-    group_id = ask("Telegram review group ID")
-    if not token or not user_id or not group_id:
-        raise RuntimeError("Bot token, Telegram user ID, and group ID are required.")
-    update_config(config_path, select_codex_skills(installed_skill_names()))
-    try:
-        run(["hermes", "profile", "create", args.profile])
-    except RuntimeError:
-        # Creating an existing profile is expected on a repeatable setup run.
-        run(["hermes", "profile", "show", args.profile])
-    profile_dir = hermes_data_dir() / "profiles" / args.profile
-    update_env(profile_dir / ".env", {
-        "TELEGRAM_BOT_TOKEN": token,
-        "TELEGRAM_ALLOWED_USERS": user_id,
-        "TELEGRAM_HOME_CHANNEL": group_id,
-    })
-    quick_command = f'{sys.executable} "{ROOT / "scripts" / "start_pr_review.py"}" --trigger telegram --detach'
-    run(["hermes", "-p", args.profile, "config", "set", "telegram.allowed_chats", json.dumps([user_id])])
-    run(["hermes", "-p", args.profile, "config", "set", "telegram.require_mention", "true"])
-    run(["hermes", "-p", args.profile, "config", "set", "telegram.exclusive_bot_mentions", "true"])
-    run(["hermes", "-p", args.profile, "config", "set", "telegram.guest_mode", "false"])
-    run(["hermes", "-p", args.profile, "config", "set", "display.background_process_notifications", "off"])
-    run(["hermes", "-p", args.profile, "config", "set", "quick_commands.pr-review.type", "exec"])
-    run(["hermes", "-p", args.profile, "config", "set", "quick_commands.pr-review.command", quick_command])
-    profile_scripts = profile_dir / "scripts"
-    profile_scripts.mkdir(parents=True, exist_ok=True)
-    wrapper = profile_scripts / "pr-review-launcher.py"
-    wrapper.write_text(f'#!/usr/bin/env python3\nimport subprocess\nsubprocess.run([{sys.executable!r}, {str(ROOT / "scripts" / "start_pr_review.py")!r}, "--trigger", "scheduled"], check=True)\n', encoding="utf-8")
+    provider = select_notification_provider()
+    skills = select_codex_skills(installed_skill_names())
+    if provider == "terminal":
+        update_config(config_path, skills, {"provider": "terminal"})
+        if not args.skip_schedules and ask_yes_no("Configure Linux cron schedules? (yes/no)"):
+            replace_linux_cron(collect_schedules())
+        elif not args.skip_schedules and shutil.which("crontab"):
+            replace_linux_cron([])
+        print("Setup complete. Authenticate GitHub with `gh auth login`, edit config.json, then run the terminal command in README.md.")
+        return 0
+
+    require_commands(("hermes",))
+    configure_hermes(args.profile)
+    update_config(config_path, skills, {"provider": "hermes", "hermes": {"profile": args.profile, "target": "telegram"}})
     if not args.skip_schedules:
-        schedules = collect_schedules()
-        existing = subprocess.run(["hermes", "-p", args.profile, "cron", "list"], capture_output=True, text=True).stdout
-        for name, schedule, _ in schedules:
-            if name not in existing:
-                run(["hermes", "-p", args.profile, "cron", "create", "--name", name, "--cron", schedule, "--script", wrapper.name, "--no-agent", "--deliver", "local"])
+        state = load_setup_state()
+        remove_hermes_schedules(args.profile, state)
+        create_hermes_schedules(args.profile, hermes_wrapper(args.profile), collect_schedules(), state)
     run(["hermes", "-p", args.profile, "gateway", "restart"])
-    print("Setup complete. Authenticate GitHub yourself with `gh auth login`, edit config.json, then run the terminal command in README.md.")
+    print("Setup complete. Authenticate GitHub with `gh auth login`, edit config.json, then run the terminal command in README.md.")
     return 0
 
 

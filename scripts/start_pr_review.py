@@ -14,7 +14,7 @@ RUNNER = Path(__file__).with_name("run_pr_reviews.py")
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trigger", choices=("terminal", "telegram", "scheduled"), default="terminal")
+    parser.add_argument("--trigger", choices=("terminal", "hermes", "scheduled"), default="terminal")
     parser.add_argument("--repo")
     parser.add_argument("--detach", action="store_true")
     args = parser.parse_args()

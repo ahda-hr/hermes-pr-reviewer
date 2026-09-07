@@ -93,8 +93,11 @@ def command(args: list[str], *, cwd: Path | None = None, clear_proxy_environment
     return result.stdout
 
 
-def require_tools() -> None:
-    missing = [tool for tool in ("git", "gh", "codex", "hermes") if shutil.which(tool) is None]
+def require_tools(notification_provider: str) -> None:
+    tools = ["git", "gh", "codex"]
+    if notification_provider == "hermes":
+        tools.append("hermes")
+    missing = [tool for tool in tools if shutil.which(tool) is None]
     if missing:
         raise RuntimeError(f"Required command(s) not found on PATH: {', '.join(missing)}")
 
@@ -177,28 +180,51 @@ def own_activity(repository: str, number: int, login: str, clear_proxy_environme
     return login in authors
 
 
+def notification_settings(config: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    notifications = config.get("notifications")
+    if not isinstance(notifications, dict):
+        raise RuntimeError("config.notifications must be an object with a provider.")
+    provider = notifications.get("provider")
+    if provider == "terminal":
+        return "terminal", {}
+    if provider != "hermes":
+        raise RuntimeError("config.notifications.provider must be 'terminal' or 'hermes'.")
+    hermes = notifications.get("hermes")
+    if not isinstance(hermes, dict):
+        raise RuntimeError("config.notifications.hermes must be an object when provider is 'hermes'.")
+    profile = hermes.get("profile")
+    target = hermes.get("target")
+    if not isinstance(profile, str) or not profile.strip() or not isinstance(target, str) or not target.strip():
+        raise RuntimeError("config.notifications.hermes.profile and target must be non-empty strings.")
+    return "hermes", {"profile": profile.strip(), "target": target.strip()}
+
+
+def active_notification_provider(configured_provider: str, trigger: str) -> str:
+    return "terminal" if trigger == "terminal" else configured_provider
+
+
 def notifier(config: dict[str, Any], trigger: str):
     clear_proxy_environment = config.get("clearProxyEnvironment") is True
-    profile = config.get("hermesProfile")
-    target = str(config.get("telegramTarget", "telegram"))
+    configured_provider, hermes_settings = notification_settings(config)
+    provider = active_notification_provider(configured_provider, trigger)
 
     def send(message: str, attachments: list[Path] | None = None) -> None:
-        if trigger == "terminal":
+        if provider == "terminal":
             print(message)
             return
-        prefix = ["hermes"] + (["-p", str(profile)] if profile else [])
+        prefix = ["hermes", "-p", hermes_settings["profile"]]
         try:
-            command(prefix + ["send", "--to", target, message, "--quiet"], clear_proxy_environment=clear_proxy_environment)
+            command(prefix + ["send", "--to", hermes_settings["target"], message, "--quiet"], clear_proxy_environment=clear_proxy_environment)
             for attachment in attachments or []:
-                command(prefix + ["send", "--to", target, f"MEDIA:{attachment}", "--quiet"], clear_proxy_environment=clear_proxy_environment)
+                command(prefix + ["send", "--to", hermes_settings["target"], f"MEDIA:{attachment}", "--quiet"], clear_proxy_environment=clear_proxy_environment)
         except Exception as error:  # Notifications must not discard the review result.
-            print(f"Warning: Telegram notification failed: {error}", file=sys.stderr)
-    return send
+            print(f"Warning: Hermes notification failed: {error}", file=sys.stderr)
+    return send, provider
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trigger", choices=("terminal", "telegram", "scheduled"), default="terminal")
+    parser.add_argument("--trigger", choices=("terminal", "hermes", "scheduled"), default="terminal")
     parser.add_argument("--repo")
     args = parser.parse_args()
     config_path = ROOT / "config.json"
@@ -209,13 +235,13 @@ def main() -> int:
     if not config_path.exists():
         raise RuntimeError(f"Missing configuration: {config_path}. Copy config.example.json to config.json first.")
     config = load_json(config_path, {})
-    send = notifier(config, args.trigger)
+    send, notification_provider = notifier(config, args.trigger)
     lock = RunLock(cache / "runner.lock")
     if not lock.acquire():
         send("PR review already running; no second run was started.")
         return 0
     try:
-        require_tools()
+        require_tools(notification_provider)
         clear_proxy_environment = config.get("clearProxyEnvironment") is True
         configured_skills = configured_skill_names(config)
         available_skills = set(installed_skill_names())

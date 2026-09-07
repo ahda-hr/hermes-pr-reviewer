@@ -1,15 +1,23 @@
 # Hermes PR Reviewer
 
-Cross-platform, scheduled GitHub pull-request review using Codex, GitHub CLI, Hermes, and Telegram. The reviewer uses a persistent bare clone, creates a temporary worktree per PR, removes it when finished, and writes Markdown reports under `reports/<repo-slug>/`.
+Scheduled GitHub pull-request review using Codex and GitHub CLI. The reviewer keeps a persistent bare clone, creates a temporary worktree per PR, removes it when finished, and writes Markdown reports under `reports/<repo-slug>/`.
 
-The bot accepts commands in its private direct message. It posts review progress and report attachments only to the configured Telegram group.
+It supports two notification modes:
+
+- **Terminal-only:** no Hermes or Telegram installation. Run reviews manually or schedule them with Linux cron; scheduled output is appended to `cache/scheduled-run.log`.
+- **Hermes/Telegram:** Hermes receives `/pr-review` in a private Telegram chat, manages schedules, and posts review progress and report attachments to the configured Telegram group.
 
 ## Prerequisites
 
-- Python 3.11 or newer
-- Git, GitHub CLI (`gh`), Codex CLI, and Hermes on `PATH`
-- A GitHub account authenticated by you: `gh auth login`
-- A dedicated Telegram bot created through BotFather and added to the review group. Keep BotFather privacy mode enabled.
+Every mode requires Python 3.11+, Git, GitHub CLI (`gh`), Codex CLI, and GitHub authentication:
+
+```bash
+gh auth login
+```
+
+Hermes/Telegram mode additionally requires Hermes on `PATH` and a dedicated Telegram bot created through BotFather and added to the review group. Keep BotFather privacy mode enabled.
+
+Terminal-only scheduled mode additionally requires the Linux `crontab` command. Windows users can run the terminal command manually or configure Task Scheduler themselves.
 
 Install Git and GitHub CLI:
 
@@ -36,23 +44,41 @@ cd hermes-pr-reviewer
 python scripts/setup.py
 ```
 
-The setup command prompts for the bot token, your Telegram user ID, and the review group ID. It lists user-installed Codex skills and lets you select skills to request for every PR review. It then asks once whether schedules should run on `weekdays` or `every day`, asks for a 24-hour time such as `05:00` or `15:30`, and asks whether to add another time. Each entered time creates a separate Hermes schedule in the machine's local timezone.
+Setup creates `config.json`, lets you choose Codex skills, and prompts for a notification mode:
 
-The token is saved only in the local Hermes profile `.env`; it is never written to this repository. Authenticate GitHub separately after setup:
+- Choose `terminal` to run without Hermes or Telegram. Setup can optionally install or replace this repository's managed Linux cron schedules.
+- Choose `hermes` to configure the Telegram bot token, private-chat user ID, review group ID, Hermes quick command, and Hermes-managed schedules.
 
-```bash
-gh auth login
-```
+`--skip-schedules` skips schedule changes. `--profile reviewer` selects the Hermes profile when using Hermes mode.
 
-Edit the local `config.json` (created from `config.example.json`) to choose repositories:
+Edit the local `config.json` to choose repositories:
 
 ```json
 {
   "repos": [
     { "repo": "OWNER/REPOSITORY", "slug": "repository", "enabled": true }
-  ]
+  ],
+  "notifications": {
+    "provider": "terminal"
+  }
 }
 ```
+
+For Hermes delivery, configure instead:
+
+```json
+{
+  "notifications": {
+    "provider": "hermes",
+    "hermes": {
+      "profile": "reviewer",
+      "target": "telegram"
+    }
+  }
+}
+```
+
+`config.json` intentionally uses a new notification schema. Existing `hermesProfile` and `telegramTarget` fields are unsupported; run setup again or update the file to the schema above. Existing Hermes schedules created by older versions must be removed manually once.
 
 Set `clearProxyEnvironment` to `true` only when inherited proxy variables point to an unavailable local proxy.
 
@@ -64,7 +90,7 @@ The setup selector only lists local folders with a `SKILL.md` file in `$CODEX_HO
 
 ## Use
 
-Run every enabled repository:
+Run every enabled repository in the terminal:
 
 ```bash
 python scripts/run_pr_reviews.py --trigger terminal
@@ -76,12 +102,14 @@ Run one repository:
 python scripts/run_pr_reviews.py --trigger terminal --repo OWNER/REPOSITORY
 ```
 
-In the reviewer bot's private chat, send `/pr-review`. It starts a detached process; a second request while a review is active reports that it was not started. The bot may still perform other tasks in direct messages. It does not handle group requests.
+The runner also accepts `--trigger scheduled` for scheduler launchers and `--trigger hermes` for Hermes quick commands. A terminal trigger always prints locally, even if the configured provider is Hermes. Scheduled runs use the configured provider.
 
-Each report is named `<repo-slug>__<pr-number>__<pr-author>.md` and includes source/target details, start/end/total time, plus 🔴 blocking, 🟡 important, and 🟢 refactor-suggestion sections. Every finding includes file/line evidence, a suggested fix, and a plain-language copyable PR reply.
+In Hermes/Telegram mode, send `/pr-review` in the reviewer's private chat. It starts a detached process; a second request while a review is active reports that it was not started. The bot may still perform other tasks in direct messages and does not handle group requests.
+
+Each report is named `<repo-slug>__<pr-number>__<pr-author>.md` and includes source/target details, start/end/total time, plus blocking, important, and refactor-suggestion sections. Every finding includes file/line evidence, a suggested fix, and a plain-language copyable PR reply.
 
 ## Security and publication
 
-`config.json`, report output, caches, worktrees, logs, and environment files are ignored by Git. Do not commit bot tokens, Telegram IDs, repository names you consider private, report content, or copied Hermes profile files.
+`config.json`, report output, caches, worktrees, logs, setup state, and environment files are ignored by Git. Do not commit bot tokens, Telegram IDs, repository names you consider private, report content, or copied Hermes profile files.
 
 Before publishing changes, run a secret scanner such as [gitleaks](https://github.com/gitleaks/gitleaks) and inspect `git status --ignored` carefully. Enable GitHub secret scanning and push protection for the repository.

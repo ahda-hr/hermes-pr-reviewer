@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 MODULE = Path(__file__).resolve().parents[1] / "scripts" / "run_pr_reviews.py"
 SPEC = importlib.util.spec_from_file_location("run_pr_reviews", MODULE)
@@ -47,6 +48,41 @@ class RunnerTests(unittest.TestCase):
 
     def test_configured_skills_are_unique(self):
         self.assertEqual(runner.configured_skill_names({"codexSkills": ["review", "review", "security"]}), ["review", "security"])
+
+    def test_terminal_notifications_do_not_require_hermes(self):
+        with patch.object(runner.shutil, "which", side_effect=lambda name: None if name == "hermes" else f"/{name}"):
+            runner.require_tools("terminal")
+        with patch.object(runner.shutil, "which", side_effect=lambda name: None if name == "hermes" else f"/{name}"):
+            with self.assertRaisesRegex(RuntimeError, "hermes"):
+                runner.require_tools("hermes")
+
+    def test_notification_settings_validate_provider_configuration(self):
+        self.assertEqual(runner.notification_settings({"notifications": {"provider": "terminal"}}), ("terminal", {}))
+        self.assertEqual(
+            runner.notification_settings({"notifications": {"provider": "hermes", "hermes": {"profile": "reviewer", "target": "telegram"}}}),
+            ("hermes", {"profile": "reviewer", "target": "telegram"}),
+        )
+        with self.assertRaisesRegex(RuntimeError, "provider"):
+            runner.notification_settings({})
+
+    def test_terminal_trigger_overrides_configured_hermes_notifications(self):
+        self.assertEqual(runner.active_notification_provider("hermes", "terminal"), "terminal")
+        self.assertEqual(runner.active_notification_provider("hermes", "scheduled"), "hermes")
+
+    def test_hermes_notifier_sends_messages_and_attachments(self):
+        calls: list[list[str]] = []
+
+        def fake_command(args, **_kwargs):
+            calls.append(args)
+            return ""
+
+        config = {"notifications": {"provider": "hermes", "hermes": {"profile": "reviewer", "target": "telegram"}}}
+        with patch.object(runner, "command", side_effect=fake_command):
+            send, provider = runner.notifier(config, "hermes")
+            send("finished", [Path("report.md")])
+        self.assertEqual(provider, "hermes")
+        self.assertEqual(calls[0], ["hermes", "-p", "reviewer", "send", "--to", "telegram", "finished", "--quiet"])
+        self.assertEqual(calls[1], ["hermes", "-p", "reviewer", "send", "--to", "telegram", "MEDIA:report.md", "--quiet"])
 
     @unittest.skipIf(os.name == "nt", "Windows file-lock integration is covered by the manual launcher test")
     def test_second_lock_is_rejected(self):
