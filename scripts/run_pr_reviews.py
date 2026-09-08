@@ -20,6 +20,14 @@ ROOT = Path(__file__).resolve().parent.parent
 PROXY_NAMES = ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY")
 PROMPT_TEMPLATE_PATH = ROOT / "prompts" / "pr-review.md"
 PLACEHOLDER_PATTERN = re.compile(r"{{[^{}]+}}")
+GITHUB_REVIEW_MARKER = "<!-- hermes-pr-reviewer -->"
+REPORT_SECTIONS = (
+    ("blocking", "blocking", "## 🔴 Blocking issues"),
+    ("important", "important", "## 🟡 Important issues"),
+    ("ternary", "suggestion", "## 🟢 Ternary refactor suggestions"),
+    ("extraction", "suggestion", "## 🟢 Extraction refactor suggestions"),
+    ("antiPattern", "suggestion", "## 🟢 Anti-pattern refactor suggestions"),
+)
 
 
 class CommandError(RuntimeError):
@@ -84,9 +92,9 @@ def clean_proxy(enabled: bool) -> Iterator[None]:
                 os.environ[name] = value
 
 
-def command(args: list[str], *, cwd: Path | None = None, clear_proxy_environment: bool = False) -> str:
+def command(args: list[str], *, cwd: Path | None = None, clear_proxy_environment: bool = False, input_text: str | None = None) -> str:
     with clean_proxy(clear_proxy_environment):
-        result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+        result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, input=input_text)
     if result.returncode:
         message = (result.stderr or result.stdout).strip()
         raise CommandError(f"{' '.join(args[:3])} failed: {message}")
@@ -141,6 +149,114 @@ def render_review_prompt(template: str, pr_number: int, base_ref: str, skills: l
     return prompt
 
 
+def github_review_mode(config: dict[str, Any]) -> str:
+    review = config.get("githubReview", {"mode": "off"})
+    if not isinstance(review, dict):
+        raise RuntimeError("config.githubReview must be an object when configured.")
+    mode = review.get("mode", "off")
+    if mode not in ("off", "pending"):
+        raise RuntimeError("config.githubReview.mode must be 'off' or 'pending'.")
+    return mode
+
+
+def order_pull_requests(pull_requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Review lower-numbered pull requests before newer ones."""
+    return sorted(pull_requests, key=lambda pull_request: int(pull_request["number"]))
+
+
+def list_open_pull_requests(repository: str, limit: int, clear_proxy_environment: bool) -> list[dict[str, Any]]:
+    output = command(
+        ["gh", "pr", "list", "--repo", repository, "--state", "open", "--search", "sort:created-asc", "--limit", str(limit), "--json", "number,author,headRefName,baseRefName,headRefOid,baseRefOid"],
+        clear_proxy_environment=clear_proxy_environment,
+    )
+    try:
+        pull_requests = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"GitHub returned invalid pull-request JSON: {error}") from error
+    if not isinstance(pull_requests, list):
+        raise RuntimeError("GitHub returned an invalid pull-request list.")
+    return order_pull_requests(pull_requests)
+
+
+def _review_line(value: Any, field: str, *, required: bool = False) -> int | None:
+    if value is None and not required:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RuntimeError(f"Review finding {field} must be a positive integer" + ("." if required else " or null."))
+    return value
+
+
+def validate_review_findings(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {"findings"} or not isinstance(value["findings"], list):
+        raise RuntimeError("Codex review output must be a JSON object containing only a findings array.")
+    sections = {category: severity for category, severity, _ in REPORT_SECTIONS}
+    required = {"category", "severity", "path", "startLine", "endLine", "title", "explanation", "excerpt", "suggestedFix", "copyableReply"}
+    findings: list[dict[str, Any]] = []
+    for index, finding in enumerate(value["findings"], start=1):
+        if not isinstance(finding, dict) or set(finding) != required:
+            raise RuntimeError(f"Review finding {index} does not match the required schema.")
+        category = finding["category"]
+        severity = finding["severity"]
+        if category not in sections or severity != sections[category]:
+            raise RuntimeError(f"Review finding {index} has an invalid category or severity.")
+        path = finding["path"]
+        if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path or ".." in path.split("/"):
+            raise RuntimeError(f"Review finding {index} has an invalid repository-relative path.")
+        start_line = _review_line(finding["startLine"], "startLine")
+        end_line = _review_line(finding["endLine"], "endLine")
+        if start_line is not None and end_line is not None and end_line < start_line:
+            raise RuntimeError(f"Review finding {index} ends before it starts.")
+        for field in ("title", "explanation", "suggestedFix", "copyableReply"):
+            if not isinstance(finding[field], str) or not finding[field].strip():
+                raise RuntimeError(f"Review finding {index} {field} must be a non-empty string.")
+        if finding["excerpt"] is not None and not isinstance(finding["excerpt"], str):
+            raise RuntimeError(f"Review finding {index} excerpt must be a string or null.")
+        findings.append({
+            **finding,
+            "path": path,
+            "title": finding["title"].strip(),
+            "explanation": finding["explanation"].strip(),
+            "suggestedFix": finding["suggestedFix"].strip(),
+            "copyableReply": finding["copyableReply"],
+        })
+    return findings
+
+
+def load_review_findings(path: Path) -> list[dict[str, Any]]:
+    try:
+        return validate_review_findings(json.loads(path.read_text(encoding="utf-8")))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Codex review output is not valid JSON: {error}") from error
+
+
+def render_review_report(findings: list[dict[str, Any]]) -> str:
+    output: list[str] = []
+    for category, _, heading in REPORT_SECTIONS:
+        output.extend((heading, ""))
+        section_findings = [finding for finding in findings if finding["category"] == category]
+        if not section_findings:
+            output.extend(("None found.", ""))
+            continue
+        for finding in section_findings:
+            start = finding["startLine"]
+            end = finding["endLine"]
+            line_label = "Line unavailable" if start is None else str(start) if end in (None, start) else f"{start}–{end}"
+            output.extend((
+                f"### `{finding['path']}` — [{finding['severity']}] {finding['title']}",
+                "",
+                f"**Lines:** `{line_label}`",
+                "",
+                finding["explanation"],
+                "",
+            ))
+            if finding["excerpt"]:
+                output.extend((f"```{finding['path']}:{line_label}", finding["excerpt"].rstrip(), "```", ""))
+            output.extend(("**Suggested fix:** " + finding["suggestedFix"], "", "**Copyable suggested reply:**"))
+            output.extend("> " + line if line else ">" for line in finding["copyableReply"].splitlines())
+            output.extend(("", "---", ""))
+    return "\n".join(output).rstrip() + "\n"
+
+
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return default
@@ -161,23 +277,101 @@ def save_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def own_activity(repository: str, number: int, login: str, clear_proxy_environment: bool) -> bool:
+def pull_request_activity(repository: str, number: int, login: str, clear_proxy_environment: bool) -> dict[str, Any]:
     owner, name = repository.split("/", 1)
-    query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100){nodes{author{login}}} comments(first:100){nodes{author{login}}} reviewThreads(first:100){nodes{comments(first:100){nodes{author{login}}}}}}}}"""
+    query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:100){nodes{author{login} body state commit{oid}}} comments(first:100){nodes{author{login}}} reviewThreads(first:100){nodes{comments(first:100){nodes{author{login} pullRequestReview{body}}}}}}}}"""
     output = command(["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}"], clear_proxy_environment=clear_proxy_environment)
     pr = json.loads(output)["data"]["repository"]["pullRequest"]
-    authors: set[str] = set()
+    tool_reviews: list[dict[str, Any]] = []
+    manual_activity = False
     for review in pr["reviews"]["nodes"]:
-        if review.get("author"):
-            authors.add(review["author"]["login"])
+        if review.get("author", {}).get("login") != login:
+            continue
+        if GITHUB_REVIEW_MARKER in str(review.get("body") or ""):
+            tool_reviews.append(review)
+        else:
+            manual_activity = True
     for comment in pr["comments"]["nodes"]:
-        if comment.get("author"):
-            authors.add(comment["author"]["login"])
+        if comment.get("author", {}).get("login") == login:
+            manual_activity = True
     for thread in pr["reviewThreads"]["nodes"]:
         for comment in thread["comments"]["nodes"]:
-            if comment.get("author"):
-                authors.add(comment["author"]["login"])
-    return login in authors
+            if comment.get("author", {}).get("login") != login:
+                continue
+            review_body = str((comment.get("pullRequestReview") or {}).get("body") or "")
+            if GITHUB_REVIEW_MARKER not in review_body:
+                manual_activity = True
+    return {"manualActivity": manual_activity, "toolReviews": tool_reviews}
+
+
+def has_pending_tool_review(activity: dict[str, Any]) -> bool:
+    return any(review.get("state") == "PENDING" for review in activity["toolReviews"])
+
+
+def has_submitted_tool_review_for_commit(activity: dict[str, Any], commit_oid: str) -> bool:
+    return any(
+        review.get("state") != "PENDING" and (review.get("commit") or {}).get("oid") == commit_oid
+        for review in activity["toolReviews"]
+    )
+
+
+def parse_diff_lines(diff: str) -> dict[str, set[int]]:
+    paths: dict[str, set[int]] = {}
+    path: str | None = None
+    new_line: int | None = None
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:]
+            paths.setdefault(path, set())
+            continue
+        if line.startswith("+++"):
+            path = None
+            continue
+        hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if hunk:
+            new_line = int(hunk.group(1))
+            continue
+        if path is None or new_line is None or not line:
+            continue
+        if line.startswith("+"):
+            paths[path].add(new_line)
+            new_line += 1
+        elif line.startswith(" "):
+            paths[path].add(new_line)
+            new_line += 1
+        elif line.startswith("-") or line.startswith("\\"):
+            continue
+    return paths
+
+
+def pending_review_comments(findings: list[dict[str, Any]], diff_lines: dict[str, set[int]]) -> tuple[list[dict[str, Any]], int]:
+    comments: list[dict[str, Any]] = []
+    skipped = 0
+    for finding in findings:
+        if finding["severity"] not in ("blocking", "important"):
+            continue
+        line = finding["startLine"]
+        if line is None or line not in diff_lines.get(finding["path"], set()):
+            skipped += 1
+            continue
+        comments.append({"path": finding["path"], "line": line, "side": "RIGHT", "body": finding["copyableReply"]})
+    return comments, skipped
+
+
+def create_pending_review(repository: str, number: int, commit_oid: str, comments: list[dict[str, Any]], clear_proxy_environment: bool) -> dict[str, Any]:
+    payload = {"commit_id": commit_oid, "body": GITHUB_REVIEW_MARKER, "comments": comments}
+    output = command(
+        ["gh", "api", "--method", "POST", f"repos/{repository}/pulls/{number}/reviews", "--input", "-"],
+        clear_proxy_environment=clear_proxy_environment,
+        input_text=json.dumps(payload),
+    )
+    try:
+        review = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"GitHub returned invalid pending-review JSON: {error}") from error
+    if review.get("state") != "PENDING" or not isinstance(review.get("id"), int):
+        raise RuntimeError("GitHub did not create a pending review.")
+    return review
 
 
 def notification_settings(config: dict[str, Any]) -> tuple[str, dict[str, str]]:
@@ -235,6 +429,7 @@ def main() -> int:
     if not config_path.exists():
         raise RuntimeError(f"Missing configuration: {config_path}. Copy config.example.json to config.json first.")
     config = load_json(config_path, {})
+    review_mode = github_review_mode(config)
     send, notification_provider = notifier(config, args.trigger)
     lock = RunLock(cache / "runner.lock")
     if not lock.acquire():
@@ -273,22 +468,34 @@ def main() -> int:
             bare = cache / f"{slug}.git"
             if not bare.exists():
                 command(["git", "clone", "--bare", f"https://github.com/{repository}.git", str(bare)], clear_proxy_environment=clear_proxy_environment)
-            raw_prs = command(["gh", "pr", "list", "--repo", repository, "--state", "open", "--limit", str(config.get("maxPrsPerRun", 10)), "--json", "number,author,headRefName,baseRefName,headRefOid,baseRefOid"], clear_proxy_environment=clear_proxy_environment)
-            for pr in json.loads(raw_prs):
+            for pr in list_open_pull_requests(repository, int(config.get("maxPrsPerRun", 10)), clear_proxy_environment):
                 author = pr["author"]["login"]
                 number = int(pr["number"])
-                if author == login or own_activity(repository, number, login, clear_proxy_environment):
+                if author == login:
+                    continue
+                activity = pull_request_activity(repository, number, login, clear_proxy_environment)
+                if activity["manualActivity"]:
+                    continue
+                if has_pending_tool_review(activity):
+                    summary.append(f"#{number} has a pending tool review; submit or discard it before a new review.")
+                    send(f"[PENDING] {repository} PR #{number} already has an unsubmitted tool review. Submit or discard it before requesting another review.")
                     continue
                 signature = "|".join(str(pr[key]) for key in ("headRefOid", "baseRefOid", "headRefName", "baseRefName"))
                 key = f"{repository}#{number}"
                 if state["prs"].get(key, {}).get("signature") == signature:
+                    continue
+                if has_submitted_tool_review_for_commit(activity, pr["headRefOid"]):
+                    state["prs"][key] = {"signature": signature, "reviewedAt": now().isoformat(), "publication": "recovered"}
+                    save_json(state_path, state)
+                    summary.append(f"#{number} already has a submitted tool review for this commit.")
                     continue
                 run_id = uuid.uuid4().hex
                 worktree = worktrees / f"{slug}-pr-{number}-{run_id}"
                 report_dir = reports / slug
                 safe_author = re.sub(r"[^A-Za-z0-9._-]", "_", author)
                 report_path = report_dir / f"{slug}__{number}__{safe_author}.md"
-                raw_path = report_dir / f".raw-{run_id}.md"
+                raw_path = report_dir / f".raw-{run_id}.json"
+                findings_path = report_path.with_suffix(".json")
                 started = now()
                 try:
                     report_dir.mkdir(parents=True, exist_ok=True)
@@ -310,12 +517,34 @@ def main() -> int:
                         codex_args.extend(["--model", str(config["codexModel"])])
                     command(codex_args + [prompt], clear_proxy_environment=clear_proxy_environment)
                     ended = now()
+                    findings = load_review_findings(raw_path)
                     header = f"# PR Review: {repository} #{number}\n\n- **Repo name:** {repository}\n- **Author:** {author}\n- **PR number:** {number}\n- **Source branch:** {pr['headRefName']} ({pr['headRefOid']})\n- **Target branch:** {pr['baseRefName']} ({pr['baseRefOid']})\n- **Start time:** {started.strftime('%Y-%m-%d %H:%M:%S %z')}\n- **End time:** {ended.strftime('%Y-%m-%d %H:%M:%S %z')}\n- **Total time:** {duration(started, ended)}\n\n"
-                    report_path.write_text(header + raw_path.read_text(encoding="utf-8"), encoding="utf-8")
-                    state["prs"][key] = {"signature": signature, "reviewedAt": ended.isoformat(), "report": str(report_path)}
+                    report_path.write_text(header + render_review_report(findings), encoding="utf-8")
+                    save_json(findings_path, {"findings": findings})
+                    state_entry: dict[str, Any] = {"signature": signature, "reviewedAt": ended.isoformat(), "report": str(report_path), "findings": str(findings_path)}
+                    if review_mode == "pending":
+                        fresh = json.loads(command(["gh", "pr", "view", str(number), "--repo", repository, "--json", "headRefOid,baseRefOid,state"], clear_proxy_environment=clear_proxy_environment))
+                        if fresh["state"] != "OPEN" or fresh["headRefOid"] != pr["headRefOid"] or fresh["baseRefOid"] != pr["baseRefOid"]:
+                            summary.append(f"#{number} changed before pending-review publication; report saved, publication deferred.")
+                            send(f"[DEFERRED] {repository} PR #{number} changed before pending-review publication; the local report was saved.", [report_path])
+                            continue
+                        diff = command(["gh", "api", "-H", "Accept: application/vnd.github.v3.diff", f"repos/{repository}/pulls/{number}"], clear_proxy_environment=clear_proxy_environment)
+                        comments, skipped = pending_review_comments(findings, parse_diff_lines(diff))
+                        state_entry["publication"] = {"mode": "pending", "skipped": skipped}
+                        if comments:
+                            pending_review = create_pending_review(repository, number, pr["headRefOid"], comments, clear_proxy_environment)
+                            state_entry["publication"].update({"status": "pending", "reviewId": pending_review["id"], "url": pending_review.get("html_url"), "comments": len(comments)})
+                            summary.append(f"#{number} reviewed; {len(comments)} pending comment(s), {skipped} retained only in the report.")
+                            send(f"[PENDING] {repository} PR #{number}: {len(comments)} draft inline comment(s) created; {skipped} eligible finding(s) were retained only in the report.", [report_path])
+                        else:
+                            state_entry["publication"]["status"] = "no-mappable-findings"
+                            summary.append(f"#{number} reviewed; no eligible findings could be mapped to the current diff.")
+                            send(f"[FINISHED] {repository} PR #{number} in {duration(started, ended)}; no eligible findings could be mapped to the current diff.", [report_path])
+                    else:
+                        summary.append(f"#{number} reviewed")
+                        send(f"[FINISHED] {repository} PR #{number} in {duration(started, ended)}", [report_path])
+                    state["prs"][key] = state_entry
                     save_json(state_path, state)
-                    summary.append(f"#{number} reviewed")
-                    send(f"[FINISHED] {repository} PR #{number} in {duration(started, ended)}", [report_path])
                 except Exception as error:
                     ended = now()
                     reason = " ".join(str(error).splitlines())

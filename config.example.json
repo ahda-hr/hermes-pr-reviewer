@@ -10,7 +10,10 @@
   "notifications": {
     "provider": "terminal"
   },
+  "githubReview": {
+    "mode": "off"
+  },
   "clearProxyEnvironment": false,
   "codexSkills": [],
-  "codexModel": null
+  "codexModel": "gpt-5.6-terra"
 }

@@ -4,7 +4,7 @@ Scheduled GitHub pull-request review using Codex and GitHub CLI. The reviewer ke
 
 It supports two notification modes:
 
-- **Terminal-only:** no Hermes or Telegram installation. Run reviews manually or schedule them with Linux cron; scheduled output is appended to `cache/scheduled-run.log`.
+- **Terminal-only:** no Hermes or Telegram installation. Run reviews manually or schedule them with a systemd user timer; scheduled output is available in both the user journal and `cache/scheduled-run.log`.
 - **Hermes/Telegram:** Hermes receives `/pr-review` in a private Telegram chat, manages schedules, and posts review progress and report attachments to the configured Telegram group.
 
 ## Prerequisites
@@ -17,7 +17,7 @@ gh auth login
 
 Hermes/Telegram mode additionally requires Hermes on `PATH` and a dedicated Telegram bot created through BotFather and added to the review group. Keep BotFather privacy mode enabled.
 
-Terminal-only scheduled mode additionally requires the Linux `crontab` command. Windows users can run the terminal command manually or configure Task Scheduler themselves.
+Terminal-only scheduled mode requires Linux with systemd. Setup enables user lingering so schedules continue after logout and reboot; Windows users can run the terminal command manually or configure Task Scheduler themselves.
 
 Install Git and GitHub CLI:
 
@@ -46,7 +46,7 @@ python scripts/setup.py
 
 Setup creates `config.json`, lets you choose Codex skills, and prompts for a notification mode:
 
-- Choose `terminal` to run without Hermes or Telegram. Setup can optionally install or replace this repository's managed Linux cron schedules.
+- Choose `terminal` to run without Hermes or Telegram. Setup can optionally install or replace this repository's managed systemd user timer and removes its legacy managed cron block when present.
 - Choose `hermes` to configure the Telegram bot token, private-chat user ID, review group ID, Hermes quick command, and Hermes-managed schedules.
 
 `--skip-schedules` skips schedule changes. `--profile reviewer` selects the Hermes profile when using Hermes mode.
@@ -82,9 +82,23 @@ For Hermes delivery, configure instead:
 
 Set `clearProxyEnvironment` to `true` only when inherited proxy variables point to an unavailable local proxy.
 
+### Optional pending GitHub reviews
+
+By default, reviews are report-only. To create a pending GitHub review containing inline comments for blocking and important findings, opt in with:
+
+```json
+{
+  "githubReview": {
+    "mode": "pending"
+  }
+}
+```
+
+The reviewer creates one draft review for the exact PR commit it analyzed. It uses each finding's copyable suggested reply verbatim, skips findings that cannot be attached to the current diff, and never submits the review. Open the PR while signed in as the same GitHub account used by `gh` to inspect, edit, and submit or discard the pending review. An unsubmitted tool-created draft blocks new automated reviews of that PR until it is resolved.
+
 ## Review prompt and Codex skills
 
-Edit [`prompts/pr-review.md`](prompts/pr-review.md) to adjust the shared review instruction. It supports `{{pr_number}}`, `{{base_ref}}`, and `{{selected_skills}}`; all three are filled for every PR.
+Edit [`prompts/pr-review.md`](prompts/pr-review.md) to adjust the shared review instruction. It supports `{{pr_number}}`, `{{base_ref}}`, and `{{selected_skills}}`; all three are filled for every PR. Codex returns validated JSON findings, which the runner renders into the Markdown report and saves as an ignored JSON sidecar for pending-review publishing.
 
 The setup selector only lists local folders with a `SKILL.md` file in `$CODEX_HOME/skills` (or `~/.codex/skills`) and excludes internal `.system` skills. The selected names are saved in local `config.json` as `codexSkills`; no skill files are copied into this repository. If a selected skill is missing later, the runner warns and continues with installed selections.
 
@@ -104,9 +118,22 @@ python scripts/run_pr_reviews.py --trigger terminal --repo OWNER/REPOSITORY
 
 The runner also accepts `--trigger scheduled` for scheduler launchers and `--trigger hermes` for Hermes quick commands. A terminal trigger always prints locally, even if the configured provider is Hermes. Scheduled runs use the configured provider.
 
+For terminal-mode schedules, inspect the next run with:
+
+```bash
+systemctl --user list-timers hermes-pr-reviewer.timer
+```
+
+View scheduled-run output with either:
+
+```bash
+journalctl --user-unit=hermes-pr-reviewer.service
+tail -f cache/scheduled-run.log
+```
+
 In Hermes/Telegram mode, send `/pr-review` in the reviewer's private chat. It starts a detached process; a second request while a review is active reports that it was not started. The bot may still perform other tasks in direct messages and does not handle group requests.
 
-Each report is named `<repo-slug>__<pr-number>__<pr-author>.md` and includes source/target details, start/end/total time, plus blocking, important, and refactor-suggestion sections. Every finding includes file/line evidence, a suggested fix, and a plain-language copyable PR reply.
+Each report is named `<repo-slug>__<pr-number>__<pr-author>.md` and has a matching JSON findings sidecar. Reports include source/target details, start/end/total time, plus blocking, important, and refactor-suggestion sections. Every finding includes file/line evidence, a suggested fix, and a plain-language copyable PR reply.
 
 ## Security and publication
 

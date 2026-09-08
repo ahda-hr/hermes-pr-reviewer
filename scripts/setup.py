@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SETUP_STATE_PATH = ROOT / ".setup-state.json"
 CRON_BEGIN = "# BEGIN hermes-pr-reviewer"
 CRON_END = "# END hermes-pr-reviewer"
+SYSTEMD_SERVICE_NAME = "hermes-pr-reviewer.service"
+SYSTEMD_TIMER_NAME = "hermes-pr-reviewer.timer"
 
 
 def ask(label: str, default: str | None = None, secret: bool = False) -> str:
@@ -160,6 +162,15 @@ def cron_for(time_of_day: str, cadence: str) -> str:
     raise ValueError(f"Unsupported cadence: {cadence}")
 
 
+def calendar_for(time_of_day: str, cadence: str) -> str:
+    hour, minute = validate_time(time_of_day).split(":")
+    if cadence == "weekdays":
+        return f"Mon..Fri *-*-* {int(hour):02d}:{int(minute):02d}:00"
+    if cadence == "every day":
+        return f"*-*-* {int(hour):02d}:{int(minute):02d}:00"
+    raise ValueError(f"Unsupported cadence: {cadence}")
+
+
 def collect_schedules() -> list[tuple[str, str, str]]:
     while True:
         cadence = ask("Run days (weekdays/every day)", "weekdays").lower()
@@ -177,24 +188,9 @@ def collect_schedules() -> list[tuple[str, str, str]]:
         if any(existing[0] == name for existing in schedules):
             print(f"{time_of_day} is already included.")
         else:
-            schedules.append((name, cron_for(time_of_day, cadence), time_of_day))
+            schedules.append((name, cadence, time_of_day))
         if not ask_yes_no("Add another review time? (yes/no)"):
             return schedules
-
-
-def managed_cron_block(schedules: list[tuple[str, str, str]]) -> str:
-    if not schedules:
-        return ""
-    command = " ".join((
-        shlex.quote(sys.executable),
-        shlex.quote(str(ROOT / "scripts" / "start_pr_review.py")),
-        "--trigger scheduled",
-        f">> {shlex.quote(str(ROOT / 'cache' / 'scheduled-run.log'))} 2>&1",
-    ))
-    lines = [CRON_BEGIN]
-    lines.extend(f"{schedule} {command}" for _, schedule, _ in schedules)
-    lines.append(CRON_END)
-    return "\n".join(lines) + "\n"
 
 
 def remove_managed_cron_block(crontab: str) -> str:
@@ -202,26 +198,88 @@ def remove_managed_cron_block(crontab: str) -> str:
     return pattern.sub("", crontab).strip()
 
 
-def replace_linux_cron(schedules: list[tuple[str, str, str]]) -> None:
-    if os.name == "nt":
-        raise RuntimeError("Native schedules are supported on Linux only. Use Task Scheduler manually on Windows.")
-    require_commands(("crontab",))
-    (ROOT / "cache").mkdir(parents=True, exist_ok=True)
+def remove_legacy_cron_schedule() -> None:
+    if shutil.which("crontab") is None:
+        return
     current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     if current.returncode == 0:
         existing = current.stdout
     elif "no crontab" in (current.stderr or "").lower():
-        existing = ""
+        return
     else:
         raise RuntimeError((current.stderr or current.stdout).strip() or "Could not read crontab.")
     updated = remove_managed_cron_block(existing)
-    block = managed_cron_block(schedules)
-    if updated and block:
-        updated += "\n"
-    updated += block
+    if updated == existing.strip():
+        return
     result = subprocess.run(["crontab", "-"], input=(updated + "\n") if updated else "", text=True, capture_output=True)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip() or "Could not update crontab.")
+
+
+def systemd_user_dir() -> Path:
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    return Path(configured) / "systemd" / "user" if configured else Path.home() / ".config" / "systemd" / "user"
+
+
+def systemd_unit_paths() -> tuple[Path, Path]:
+    directory = systemd_user_dir()
+    return directory / SYSTEMD_SERVICE_NAME, directory / SYSTEMD_TIMER_NAME
+
+
+def systemd_service_contents() -> str:
+    log_path = ROOT / "cache" / "scheduled-run.log"
+    runner = " ".join((shlex.quote(sys.executable), shlex.quote(str(ROOT / "scripts" / "start_pr_review.py")), "--trigger", "scheduled"))
+    command = f"{runner} 2>&1 | /usr/bin/tee -a {shlex.quote(str(log_path))}"
+    return "\n".join((
+        "[Unit]",
+        "Description=Hermes PR Reviewer scheduled run",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        f"WorkingDirectory={ROOT}",
+        f"ExecStart=/usr/bin/bash -o pipefail -c {shlex.quote(command)}",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+    ))
+
+
+def systemd_timer_contents(schedules: list[tuple[str, str, str]]) -> str:
+    if not schedules:
+        raise RuntimeError("At least one schedule is required for a systemd timer.")
+    lines = ["[Unit]", "Description=Run Hermes PR Reviewer on schedule", "", "[Timer]"]
+    lines.extend(f"OnCalendar={calendar_for(time_of_day, cadence)}" for _, cadence, time_of_day in schedules)
+    lines.extend(("Persistent=true", f"Unit={SYSTEMD_SERVICE_NAME}", "", "[Install]", "WantedBy=timers.target", ""))
+    return "\n".join(lines)
+
+
+def install_systemd_schedules(schedules: list[tuple[str, str, str]]) -> None:
+    if os.name == "nt":
+        raise RuntimeError("Native schedules are supported on Linux only. Use Task Scheduler manually on Windows.")
+    require_commands(("systemctl", "loginctl", "bash", "tee"))
+    run(["loginctl", "enable-linger", getpass.getuser()])
+    service_path, timer_path = systemd_unit_paths()
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    (ROOT / "cache").mkdir(parents=True, exist_ok=True)
+    service_path.write_text(systemd_service_contents(), encoding="utf-8")
+    timer_path.write_text(systemd_timer_contents(schedules), encoding="utf-8")
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "enable", "--now", SYSTEMD_TIMER_NAME])
+
+
+def remove_systemd_schedules() -> None:
+    service_path, timer_path = systemd_unit_paths()
+    if not service_path.exists() and not timer_path.exists():
+        return
+    require_commands(("systemctl",))
+    try:
+        run(["systemctl", "--user", "disable", "--now", SYSTEMD_TIMER_NAME])
+    except RuntimeError as error:
+        if not any(phrase in str(error).lower() for phrase in ("not loaded", "not found", "does not exist")):
+            raise
+    timer_path.unlink(missing_ok=True)
+    service_path.unlink(missing_ok=True)
+    run(["systemctl", "--user", "daemon-reload"])
 
 
 def extract_hermes_job_id(output: str) -> str:
@@ -258,7 +316,8 @@ def remove_hermes_schedules(profile: str, state: dict[str, Any]) -> None:
 def create_hermes_schedules(profile: str, wrapper: Path, schedules: list[tuple[str, str, str]], state: dict[str, Any]) -> None:
     created: list[str] = []
     try:
-        for name, schedule, _ in schedules:
+        for name, cadence, time_of_day in schedules:
+            schedule = cron_for(time_of_day, cadence)
             output = run([
                 "hermes", "-p", profile, "cron", "create", schedule,
                 "--name", name, "--script", wrapper.name, "--no-agent", "--deliver", "local",
@@ -327,10 +386,12 @@ def main() -> int:
     skills = select_codex_skills(installed_skill_names())
     if provider == "terminal":
         update_config(config_path, skills, {"provider": "terminal"})
-        if not args.skip_schedules and ask_yes_no("Configure Linux cron schedules? (yes/no)"):
-            replace_linux_cron(collect_schedules())
-        elif not args.skip_schedules and shutil.which("crontab"):
-            replace_linux_cron([])
+        if not args.skip_schedules and ask_yes_no("Configure systemd schedules? (yes/no)"):
+            install_systemd_schedules(collect_schedules())
+            remove_legacy_cron_schedule()
+        elif not args.skip_schedules:
+            remove_systemd_schedules()
+            remove_legacy_cron_schedule()
         print("Setup complete. Authenticate GitHub with `gh auth login`, edit config.json, then run the terminal command in README.md.")
         return 0
 

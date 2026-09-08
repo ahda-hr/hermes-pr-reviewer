@@ -4,33 +4,37 @@ Compare the current `HEAD` against `{{base_ref}}`.
 
 {{selected_skills}}
 
-Return Markdown containing ONLY the following five sections, in this order:
+Return only valid JSON. Do not use Markdown fences, prose before or after the JSON, or fields outside this schema:
 
-## 🔴 Blocking issues
+```json
+{
+  "findings": [
+    {
+      "category": "blocking | important | ternary | extraction | antiPattern",
+      "severity": "blocking | important | suggestion",
+      "path": "repository-relative/path.ext",
+      "startLine": 42,
+      "endLine": 42,
+      "title": "Concise title",
+      "explanation": "Concrete impact in plain language.",
+      "excerpt": "Optional short code excerpt without Markdown fences, or null.",
+      "suggestedFix": "Specific, practical fix.",
+      "copyableReply": "Short, respectful GitHub PR comment stating the problem, why it matters, and requested change."
+    }
+  ]
+}
+```
 
-## 🟡 Important issues
+Use `blocking` only for release-blocking correctness, security, data-loss, or severe user-impact risks. Use `important` for meaningful issues that should be fixed before merge. Use `suggestion` only for non-blocking refactors.
 
-## 🟢 Ternary refactor suggestions
+Use these category/severity pairs exactly:
 
-## 🟢 Extraction refactor suggestions
+- `blocking` / `blocking`
+- `important` / `important`
+- `ternary` / `suggestion`
+- `extraction` / `suggestion`
+- `antiPattern` / `suggestion`
 
-## 🟢 Anti-pattern refactor suggestions
+Use `null` for `startLine` and `endLine` only when no line in the current `HEAD` can be cited. Otherwise, cite accurate one-based line numbers from the current `HEAD`; `endLine` may equal `startLine`. Keep paths repository-relative. Do not modify files.
 
-Use `None found.` directly below a section heading when it has no findings. Do not add a summary, preamble, conclusion, or any other section.
-
-For every finding, use this exact shape:
-
-### `repository-relative/path.ext` — [blocking|important|suggestion] Concise title
-
-**Lines:** `start–end` or the affected symbol/key path
-
-Explain the concrete impact in plain language. Include a short fenced code excerpt with the repository-relative path and line range when code context makes the finding clearer. Do not include unrelated code.
-
-**Suggested fix:** A specific, practical fix.
-
-**Copyable suggested reply:**
-> A short, respectful, easy-to-understand message the reviewer can paste into a GitHub PR comment. State the problem, why it matters, and the requested change without jargon.
-
----
-
-Use `blocking` only for release-blocking correctness, security, data-loss, or severe user-impact risks. Use `important` for meaningful issues that should be fixed before merge. Use `suggestion` only for non-blocking refactors. Cite repository-relative file paths and accurate line numbers. Do not modify files.
+`copyableReply` is used verbatim as a pending GitHub review comment for blocking and important findings. It must be self-contained and must not include Markdown blockquote markers, a title, a severity label, or any mention of this automation.
