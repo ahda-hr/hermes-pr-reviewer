@@ -92,8 +92,9 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("\033[", runner.format_terminal("[FAILED] x"))
 
     def test_terminal_format_lists_summary_items(self):
-        out = runner.format_terminal("PR review completed: #1 reviewed; #2 failed: boom")
-        self.assertEqual(out.splitlines(), ["Done", "  - #1 reviewed", "  - #2 failed: boom"])
+        out = runner.format_terminal("PR review completed:\no/a\n  - #1 reviewed\n  - #2 failed: boom\no/b\n  - #3 reviewed")
+        self.assertEqual(out.splitlines(), ["Done", "o/a", "  - #1 reviewed", "  - #2 failed: boom", "o/b", "  - #3 reviewed"])
+        self.assertEqual(runner.format_terminal("PR review completed: no eligible changed PRs found."), "Done: no eligible changed PRs found.")
 
     def test_finding_counts(self):
         self.assertEqual(runner.finding_counts([]), "no findings")

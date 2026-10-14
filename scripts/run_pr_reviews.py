@@ -444,7 +444,7 @@ def active_notification_provider(configured_provider: str, trigger: str) -> str:
     return "terminal" if trigger == "terminal" else configured_provider
 
 
-TERMINAL_TAG_COLORS = {"STARTED": "36", "FINISHED": "32", "PENDING": "33", "DEFERRED": "33", "FAILED": "31", "WARNING": "33"}
+TERMINAL_TAG_COLORS = {"STARTED": "36", "FINISHED": "32", "PENDING": "33", "DEFERRED": "33", "FAILED": "31", "WARNING": "33", "SKIPPED": "90"}
 TERMINAL_TAG_PATTERN = re.compile(r"^\[([A-Z]+)\] ")
 
 
@@ -459,9 +459,10 @@ def format_terminal(message: str, attachments: list[Path] | None = None, *, colo
     def paint(text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if color else text
 
-    if message.startswith("PR review completed: "):
-        items = [item.strip() for item in message.removeprefix("PR review completed: ").split("; ") if item.strip()]
-        lines = [paint("Done", "1")] + [f"  - {item}" for item in items] if len(items) > 1 else [paint("Done", "1") + f": {items[0] if items else 'nothing to do'}"]
+    if message.startswith("PR review completed:"):
+        head, *body = message.removeprefix("PR review completed:").lstrip(" ").split("\n")
+        lines = [paint("Done", "1") + (f": {head}" if head else "")]
+        lines.extend(line if line.startswith("  - ") else paint(line, "1") for line in body)
     else:
         tag = TERMINAL_TAG_PATTERN.match(message)
         if tag:
@@ -536,6 +537,10 @@ def main() -> int:
         if not repositories:
             send("PR review finished: no enabled repositories are configured.")
             return 0
+        def skip(message: str) -> None:
+            if notification_provider == "terminal":  # Too chatty for Telegram; the terminal shows every open PR.
+                send(message)
+
         if notification_provider == "terminal":
             model = agent["model"] or "default model"
             send(f"Reviewing {len(repositories)} repo(s) as {login} with {agent['provider']} ({model}): " + ", ".join(item.get("repo", "?") for item in repositories))
@@ -543,11 +548,12 @@ def main() -> int:
         worktrees.mkdir(parents=True, exist_ok=True)
         state = load_json(state_path, {"prs": {}})
         state.setdefault("prs", {})
-        summary: list[str] = []
+        summaries: dict[str, list[str]] = {}
         for repo_config in repositories:
             repository = str(repo_config.get("repo", ""))
             if not re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
                 raise RuntimeError(f"Invalid repository in config: {repository}")
+            summary = summaries.setdefault(repository, [])
             slug = str(repo_config.get("slug") or repository.replace("/", "__"))
             bare = cache / f"{slug}.git"
             if not bare.exists():
@@ -555,10 +561,12 @@ def main() -> int:
             for pr in list_open_pull_requests(repository, int(config.get("maxPrsPerRun", 10)), clear_proxy_environment):
                 author = pr["author"]["login"]
                 number = int(pr["number"])
+                skipped_label = f"[SKIPPED] {repository} PR #{number} by {author}"
                 if author == login:
                     continue
                 activity = pull_request_activity(repository, number, login, clear_proxy_environment)
                 if activity["manualActivity"]:
+                    skip(f"{skipped_label} - you already reviewed or commented manually")
                     continue
                 if has_pending_tool_review(activity):
                     summary.append(f"#{number} has a pending tool review; submit or discard it before a new review.")
@@ -567,11 +575,13 @@ def main() -> int:
                 signature = "|".join(str(pr[key]) for key in ("headRefOid", "baseRefOid", "headRefName", "baseRefName"))
                 key = f"{repository}#{number}"
                 if state["prs"].get(key, {}).get("signature") == signature:
+                    skip(f"{skipped_label} - unchanged since last review")
                     continue
                 if has_submitted_tool_review_for_commit(activity, pr["headRefOid"]):
                     state["prs"][key] = {"signature": signature, "reviewedAt": now().isoformat(), "publication": "recovered"}
                     save_json(state_path, state)
                     summary.append(f"#{number} already has a submitted tool review for this commit.")
+                    skip(f"{skipped_label} - review already submitted for this commit")
                     continue
                 run_id = uuid.uuid4().hex
                 worktree = worktrees / f"{slug}-pr-{number}-{run_id}"
@@ -636,7 +646,8 @@ def main() -> int:
                         subprocess.run(["git", f"--git-dir={bare}", "worktree", "remove", "--force", str(worktree)], capture_output=True, text=True)
                         shutil.rmtree(worktree, ignore_errors=True)
                     raw_path.unlink(missing_ok=True)
-        send("PR review completed: " + ("; ".join(summary) if summary else "no eligible changed PRs found."))
+        sections = [f"{repository}\n" + "\n".join(f"  - {item}" for item in items) for repository, items in summaries.items() if items]
+        send("PR review completed:" + ("\n" + "\n".join(sections) if sections else " no eligible changed PRs found."))
         return 0
     except Exception as error:
         send(f"PR review failed: {error}")
