@@ -70,18 +70,32 @@ def codex_skills_root() -> Path:
     return Path(configured_home) / "skills" if configured_home else Path.home() / ".codex" / "skills"
 
 
-def installed_skill_names() -> list[str]:
-    root = codex_skills_root()
+def claude_skills_root() -> Path:
+    configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured_home) / "skills" if configured_home else Path.home() / ".claude" / "skills"
+
+
+def installed_skill_names(provider: str = "codex") -> list[str]:
+    root = claude_skills_root() if provider == "claude" else codex_skills_root()
     if not root.is_dir():
         return []
     return sorted(child.name for child in root.iterdir() if child.is_dir() and child.name != ".system" and (child / "SKILL.md").is_file())
 
 
-def select_codex_skills(skills: list[str]) -> list[str]:
+def select_agent_provider(current: str = "codex") -> str:
+    while True:
+        provider = ask("Review agent (codex/claude)", current).lower()
+        if provider in ("codex", "claude"):
+            return provider
+        print("Choose either 'codex' or 'claude'.")
+
+
+def select_skills(skills: list[str], provider: str = "codex") -> list[str]:
+    label = provider.capitalize()
     if not skills:
-        print("No user-installed Codex skills were found; continuing without additional skills.")
+        print(f"No user-installed {label} skills were found; continuing without additional skills.")
         return []
-    print("Available user-installed Codex skills:")
+    print(f"Available user-installed {label} skills:")
     for index, skill in enumerate(skills, start=1):
         print(f"  {index}. {skill}")
     while True:
@@ -119,13 +133,15 @@ def update_env(path: Path, updates: dict[str, str]) -> None:
     path.write_text("".join(f"{key}={value}\n" for key, value in existing.items()), encoding="utf-8")
 
 
-def update_config(path: Path, codex_skills: list[str], notifications: dict[str, Any]) -> None:
+def update_config(path: Path, agent_provider: str, skills: list[str], notifications: dict[str, Any]) -> None:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict):
         raise RuntimeError(f"Expected an object in {path}")
     data.pop("hermesProfile", None)
     data.pop("telegramTarget", None)
-    data["codexSkills"] = codex_skills
+    agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+    data["agent"] = {**agent, "provider": agent_provider}
+    data[f"{agent_provider}Skills"] = skills
     data["notifications"] = notifications
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
@@ -377,15 +393,18 @@ def main() -> int:
     parser.add_argument("--profile", default="reviewer")
     parser.add_argument("--skip-schedules", action="store_true")
     args = parser.parse_args()
-    require_commands(("git", "gh", "codex"))
+    require_commands(("git", "gh"))
     config_path = ROOT / "config.json"
     if not config_path.exists():
         shutil.copyfile(ROOT / "config.example.json", config_path)
         print(f"Created {config_path}; edit its repository list before your first review.")
+    existing = json.loads(config_path.read_text(encoding="utf-8-sig")).get("agent", {})
+    agent_provider = select_agent_provider(existing.get("provider", "codex") if isinstance(existing, dict) else "codex")
+    require_commands((agent_provider,))
     provider = select_notification_provider()
-    skills = select_codex_skills(installed_skill_names())
+    skills = select_skills(installed_skill_names(agent_provider), agent_provider)
     if provider == "terminal":
-        update_config(config_path, skills, {"provider": "terminal"})
+        update_config(config_path, agent_provider, skills, {"provider": "terminal"})
         if not args.skip_schedules and ask_yes_no("Configure systemd schedules? (yes/no)"):
             install_systemd_schedules(collect_schedules())
             remove_legacy_cron_schedule()
@@ -397,7 +416,7 @@ def main() -> int:
 
     require_commands(("hermes",))
     configure_hermes(args.profile)
-    update_config(config_path, skills, {"provider": "hermes", "hermes": {"profile": args.profile, "target": "telegram"}})
+    update_config(config_path, agent_provider, skills, {"provider": "hermes", "hermes": {"profile": args.profile, "target": "telegram"}})
     if not args.skip_schedules:
         state = load_setup_state()
         remove_hermes_schedules(args.profile, state)

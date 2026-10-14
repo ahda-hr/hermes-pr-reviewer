@@ -1,6 +1,6 @@
 # Hermes PR Reviewer
 
-Scheduled GitHub pull-request review using Codex and GitHub CLI. The reviewer keeps a persistent bare clone, creates a temporary worktree per PR, removes it when finished, and writes Markdown reports under `reports/<repo-slug>/`.
+Scheduled GitHub pull-request review using Codex or Claude Code and GitHub CLI. The reviewer keeps a persistent bare clone, creates a temporary worktree per PR, removes it when finished, and writes Markdown reports under `reports/<repo-slug>/`.
 
 It supports two notification modes:
 
@@ -9,7 +9,7 @@ It supports two notification modes:
 
 ## Prerequisites
 
-Every mode requires Python 3.11+, Git, GitHub CLI (`gh`), Codex CLI, and GitHub authentication:
+Every mode requires Python 3.11+, Git, GitHub CLI (`gh`), the review agent's CLI (Codex or Claude Code), and GitHub authentication:
 
 ```bash
 gh auth login
@@ -44,7 +44,7 @@ cd hermes-pr-reviewer
 python scripts/setup.py
 ```
 
-Setup creates `config.json`, lets you choose Codex skills, and prompts for a notification mode:
+Setup creates `config.json`, lets you choose the review agent and its skills, and prompts for a notification mode:
 
 - Choose `terminal` to run without Hermes or Telegram. Setup can optionally install or replace this repository's managed systemd user timer and removes its legacy managed cron block when present.
 - Choose `hermes` to configure the Telegram bot token, private-chat user ID, review group ID, Hermes quick command, and Hermes-managed schedules.
@@ -96,13 +96,53 @@ By default, reviews are report-only. To create a pending GitHub review containin
 
 The reviewer creates one draft review for the exact PR commit it analyzed. It uses each finding's copyable suggested reply verbatim, skips findings that cannot be attached to the current diff, and never submits the review. Open the PR while signed in as the same GitHub account used by `gh` to inspect, edit, and submit or discard the pending review. An unsubmitted tool-created draft blocks new automated reviews of that PR until it is resolved.
 
-## Review prompt and Codex skills
+## Review agent
 
-Edit [`prompts/pr-review.md`](prompts/pr-review.md) to adjust the shared review instruction. It supports `{{pr_number}}`, `{{base_ref}}`, and `{{selected_skills}}`; all three are filled for every PR. Codex returns validated JSON findings, which the runner renders into the Markdown report and saves as an ignored JSON sidecar for pending-review publishing.
+Choose the agent that performs each review in `config.json` (setup asks for this too):
 
-The setup selector only lists local folders with a `SKILL.md` file in `$CODEX_HOME/skills` (or `~/.codex/skills`) and excludes internal `.system` skills. The selected names are saved in local `config.json` as `codexSkills`; no skill files are copied into this repository. If a selected skill is missing later, the runner warns and continues with installed selections.
+```json
+{
+  "agent": { "provider": "claude", "model": "sonnet" }
+}
+```
+
+- `provider` is `codex` (default) or `claude`. `model` is optional and passed straight to the CLI. Claude examples: `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-5-5`, or the aliases `sonnet`/`opus`/`haiku`. Codex examples: `gpt-6-luna`, `gpt-5.6-luna`, `gpt-5.6-terra` (run `codex` and check `~/.codex/models_cache.json` for what your account offers). JSON has no comments, so `config.example.json` carries these examples in a `_comment` field, which the runner ignores. If `model` is omitted the CLI default is used; for Codex it falls back to the legacy `codexModel` field.
+- Codex runs with `--sandbox read-only`. Claude runs `claude -p` in the PR worktree with `--permission-mode dontAsk` and only read tools plus `git diff/log/show/blame` allowed.
+- Scheduled runs need the agent to be authenticated non-interactively (Claude: an existing login or `ANTHROPIC_API_KEY` in the timer's environment).
+- Skills are stored per agent: `codexSkills` (from `$CODEX_HOME/skills`) or `claudeSkills` (from `~/.claude/skills`, or `$CLAUDE_CONFIG_DIR/skills`).
+
+## Review prompt and skills
+
+Edit [`prompts/pr-review.md`](prompts/pr-review.md) to adjust the shared review instruction. It supports `{{pr_number}}`, `{{base_ref}}`, and `{{selected_skills}}`; all three are filled for every PR. The agent returns validated JSON findings, which the runner renders into the Markdown report and saves as an ignored JSON sidecar for pending-review publishing.
+
+The setup selector only lists local folders with a `SKILL.md` file in the chosen agent's skills directory (`~/.codex/skills` or `~/.claude/skills`) and excludes internal `.system` skills. The selected names are saved in local `config.json` as `codexSkills` or `claudeSkills`; no skill files are copied into this repository. If a selected skill is missing later, the runner warns and continues with installed selections.
 
 ## Use
+
+Install a terminal command on Linux/macOS:
+
+```bash
+python scripts/install_command.py
+```
+
+This installs `pr-review` in `~/.local/bin`, pointing to this checkout and the
+Python interpreter used for installation. If that directory is not on `PATH`,
+the installer prints the line to add to your shell configuration. Run the
+installer again if you move the checkout or change Python installations.
+
+Then run from any directory:
+
+```bash
+pr-review
+pr-review --repo OWNER/REPOSITORY
+pr-review --detach
+```
+
+The command uses this checkout's `config.json` and defaults to terminal output.
+`--repo` selects an enabled repository already in that configuration.
+Detached runs write output to `cache/runner.log` in this checkout.
+Use `--bin-dir /path/on/PATH` to choose another installation directory.
+The installer refuses to overwrite an unrelated existing command.
 
 Run every enabled repository in the terminal:
 

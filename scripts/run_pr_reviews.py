@@ -101,8 +101,24 @@ def command(args: list[str], *, cwd: Path | None = None, clear_proxy_environment
     return result.stdout
 
 
-def require_tools(notification_provider: str) -> None:
-    tools = ["git", "gh", "codex"]
+AGENT_PROVIDERS = ("codex", "claude")
+CLAUDE_ALLOWED_TOOLS = ("Read", "Grep", "Glob", "Skill", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git blame:*)")
+CODE_FENCE_PATTERN = re.compile(r"^\s*```(?:json)?\s*\n(.*?)\n\s*```\s*$", re.DOTALL)
+
+
+def agent_config(config: dict[str, Any]) -> dict[str, Any]:
+    agent = config.get("agent", {})
+    if not isinstance(agent, dict):
+        raise RuntimeError("config.agent must be an object when configured.")
+    provider = agent.get("provider", "codex")
+    if provider not in AGENT_PROVIDERS:
+        raise RuntimeError("config.agent.provider must be one of: " + ", ".join(AGENT_PROVIDERS) + ".")
+    model = agent.get("model") or (config.get("codexModel") if provider == "codex" else None)
+    return {"provider": provider, "model": str(model) if model else None}
+
+
+def require_tools(notification_provider: str, agent_provider: str = "codex") -> None:
+    tools = ["git", "gh", agent_provider]
     if notification_provider == "hermes":
         tools.append("hermes")
     missing = [tool for tool in tools if shutil.which(tool) is None]
@@ -115,17 +131,23 @@ def codex_skills_root() -> Path:
     return Path(configured_home) / "skills" if configured_home else Path.home() / ".codex" / "skills"
 
 
-def installed_skill_names() -> list[str]:
-    root = codex_skills_root()
+def claude_skills_root() -> Path:
+    configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured_home) / "skills" if configured_home else Path.home() / ".claude" / "skills"
+
+
+def installed_skill_names(provider: str = "codex") -> list[str]:
+    root = claude_skills_root() if provider == "claude" else codex_skills_root()
     if not root.is_dir():
         return []
     return sorted(child.name for child in root.iterdir() if child.is_dir() and child.name != ".system" and (child / "SKILL.md").is_file())
 
 
-def configured_skill_names(config: dict[str, Any]) -> list[str]:
-    configured = config.get("codexSkills", [])
+def configured_skill_names(config: dict[str, Any], provider: str = "codex") -> list[str]:
+    key = f"{provider}Skills"
+    configured = config.get(key, [])
     if not isinstance(configured, list) or any(not isinstance(name, str) or not name.strip() for name in configured):
-        raise RuntimeError("config.codexSkills must be an array of non-empty skill names.")
+        raise RuntimeError(f"config.{key} must be an array of non-empty skill names.")
     return list(dict.fromkeys(name.strip() for name in configured))
 
 
@@ -135,10 +157,12 @@ def load_review_template() -> str:
     return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-def render_review_prompt(template: str, pr_number: int, base_ref: str, skills: list[str]) -> str:
+def render_review_prompt(template: str, pr_number: int, base_ref: str, skills: list[str], provider: str = "codex") -> str:
+    label = provider.capitalize()
+    prefix = "$" if provider == "codex" else ""
     skill_instruction = (
-        "Use these installed Codex skills as part of this review: " + ", ".join(f"${name}" for name in skills) + "."
-        if skills else "No additional Codex skills were selected for this review."
+        f"Use these installed {label} skills as part of this review: " + ", ".join(f"{prefix}{name}" for name in skills) + "."
+        if skills else f"No additional {label} skills were selected for this review."
     )
     prompt = (template.replace("{{pr_number}}", str(pr_number))
             .replace("{{base_ref}}", base_ref)
@@ -188,7 +212,7 @@ def _review_line(value: Any, field: str, *, required: bool = False) -> int | Non
 
 def validate_review_findings(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, dict) or set(value) != {"findings"} or not isinstance(value["findings"], list):
-        raise RuntimeError("Codex review output must be a JSON object containing only a findings array.")
+        raise RuntimeError("Review output must be a JSON object containing only a findings array.")
     sections = {category: severity for category, severity, _ in REPORT_SECTIONS}
     required = {"category", "severity", "path", "startLine", "endLine", "title", "explanation", "excerpt", "suggestedFix", "copyableReply"}
     findings: list[dict[str, Any]] = []
@@ -226,7 +250,30 @@ def load_review_findings(path: Path) -> list[dict[str, Any]]:
     try:
         return validate_review_findings(json.loads(path.read_text(encoding="utf-8")))
     except json.JSONDecodeError as error:
-        raise RuntimeError(f"Codex review output is not valid JSON: {error}") from error
+        raise RuntimeError(f"Review output is not valid JSON: {error}") from error
+
+
+def run_review_agent(agent: dict[str, Any], worktree: Path, prompt: str, raw_path: Path, clear_proxy_environment: bool) -> None:
+    """Run the configured agent read-only in the worktree and write its final message to raw_path."""
+    if agent["provider"] == "codex":
+        args = ["codex", "exec", "-C", str(worktree), "--sandbox", "read-only", "--output-last-message", str(raw_path)]
+        if agent["model"]:
+            args.extend(["--model", agent["model"]])
+        command(args + [prompt], clear_proxy_environment=clear_proxy_environment)
+        return
+    args = ["claude", "-p", "--output-format", "json", "--permission-mode", "dontAsk", "--allowedTools", ",".join(CLAUDE_ALLOWED_TOOLS)]
+    if agent["model"]:
+        args.extend(["--model", agent["model"]])
+    output = command(args, cwd=worktree, clear_proxy_environment=clear_proxy_environment, input_text=prompt)
+    try:
+        envelope = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Claude returned invalid output: {error}") from error
+    if not isinstance(envelope, dict) or envelope.get("is_error") or not isinstance(envelope.get("result"), str):
+        raise RuntimeError("Claude review failed: " + str(envelope.get("result") if isinstance(envelope, dict) else envelope)[:300])
+    result = envelope["result"].strip()
+    fenced = CODE_FENCE_PATTERN.match(result)
+    raw_path.write_text(fenced.group(1) if fenced else result, encoding="utf-8")
 
 
 def render_review_report(findings: list[dict[str, Any]]) -> str:
@@ -397,6 +444,38 @@ def active_notification_provider(configured_provider: str, trigger: str) -> str:
     return "terminal" if trigger == "terminal" else configured_provider
 
 
+TERMINAL_TAG_COLORS = {"STARTED": "36", "FINISHED": "32", "PENDING": "33", "DEFERRED": "33", "FAILED": "31", "WARNING": "33"}
+TERMINAL_TAG_PATTERN = re.compile(r"^\[([A-Z]+)\] ")
+
+
+def finding_counts(findings: list[dict[str, Any]]) -> str:
+    counts = [(sum(1 for finding in findings if finding["severity"] == severity), label)
+              for severity, label in (("blocking", "blocking"), ("important", "important"), ("suggestion", "suggestion(s)"))]
+    return ", ".join(f"{count} {label}" for count, label in counts if count) or "no findings"
+
+
+def format_terminal(message: str, attachments: list[Path] | None = None, *, color: bool = False, stamp: str = "") -> str:
+    """Render a notification for the terminal: timestamp, colored status tag, summary list and report paths."""
+    def paint(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if color else text
+
+    if message.startswith("PR review completed: "):
+        items = [item.strip() for item in message.removeprefix("PR review completed: ").split("; ") if item.strip()]
+        lines = [paint("Done", "1")] + [f"  - {item}" for item in items] if len(items) > 1 else [paint("Done", "1") + f": {items[0] if items else 'nothing to do'}"]
+    else:
+        tag = TERMINAL_TAG_PATTERN.match(message)
+        if tag:
+            message = paint(f"{tag.group(1):<8}", "1;" + TERMINAL_TAG_COLORS.get(tag.group(1), "37")) + " " + message[tag.end():]
+        elif message.startswith("Warning:"):
+            message = paint("WARNING ", "1;33") + " " + message.removeprefix("Warning:").strip()
+        elif message.startswith("PR review failed:"):
+            message = paint("FAILED  ", "1;31") + " " + message.removeprefix("PR review failed:").strip()
+        lines = [message]
+    lines.extend(f"         report: {attachment}" for attachment in attachments or [])
+    prefix = paint(stamp, "2") + "  " if stamp else ""
+    return "\n".join(prefix + line if index == 0 else (" " * (len(stamp) + 2) if stamp else "") + line for index, line in enumerate(lines))
+
+
 def notifier(config: dict[str, Any], trigger: str):
     clear_proxy_environment = config.get("clearProxyEnvironment") is True
     configured_provider, hermes_settings = notification_settings(config)
@@ -404,7 +483,8 @@ def notifier(config: dict[str, Any], trigger: str):
 
     def send(message: str, attachments: list[Path] | None = None) -> None:
         if provider == "terminal":
-            print(message)
+            color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+            print(format_terminal(message, attachments, color=color, stamp=time.strftime("%H:%M:%S")), flush=True)
             return
         prefix = ["hermes", "-p", hermes_settings["profile"]]
         try:
@@ -436,14 +516,15 @@ def main() -> int:
         send("PR review already running; no second run was started.")
         return 0
     try:
-        require_tools(notification_provider)
+        agent = agent_config(config)
+        require_tools(notification_provider, agent["provider"])
         clear_proxy_environment = config.get("clearProxyEnvironment") is True
-        configured_skills = configured_skill_names(config)
-        available_skills = set(installed_skill_names())
+        configured_skills = configured_skill_names(config, agent["provider"])
+        available_skills = set(installed_skill_names(agent["provider"]))
         selected_skills = [name for name in configured_skills if name in available_skills]
         missing_skills = [name for name in configured_skills if name not in available_skills]
         if missing_skills:
-            send("Warning: configured Codex skill(s) not installed; continuing without them: " + ", ".join(missing_skills))
+            send(f"Warning: configured {agent['provider']} skill(s) not installed; continuing without them: " + ", ".join(missing_skills))
         prompt_template = load_review_template()
         try:
             login = command(["gh", "api", "user", "--jq", ".login"], clear_proxy_environment=clear_proxy_environment).strip()
@@ -455,6 +536,9 @@ def main() -> int:
         if not repositories:
             send("PR review finished: no enabled repositories are configured.")
             return 0
+        if notification_provider == "terminal":
+            model = agent["model"] or "default model"
+            send(f"Reviewing {len(repositories)} repo(s) as {login} with {agent['provider']} ({model}): " + ", ".join(item.get("repo", "?") for item in repositories))
         cache.mkdir(parents=True, exist_ok=True)
         worktrees.mkdir(parents=True, exist_ok=True)
         state = load_json(state_path, {"prs": {}})
@@ -511,11 +595,8 @@ def main() -> int:
                         continue
                     command(["git", f"--git-dir={bare}", "worktree", "add", "--detach", str(worktree), f"refs/pr/{number}/head"], clear_proxy_environment=clear_proxy_environment)
                     send(f"[STARTED] {repository} PR #{number} by {author} ({pr['headRefName']} -> {pr['baseRefName']})")
-                    prompt = render_review_prompt(prompt_template, number, f"refs/pr/{number}/base", selected_skills)
-                    codex_args = ["codex", "exec", "-C", str(worktree), "--sandbox", "read-only", "--output-last-message", str(raw_path)]
-                    if config.get("codexModel"):
-                        codex_args.extend(["--model", str(config["codexModel"])])
-                    command(codex_args + [prompt], clear_proxy_environment=clear_proxy_environment)
+                    prompt = render_review_prompt(prompt_template, number, f"refs/pr/{number}/base", selected_skills, agent["provider"])
+                    run_review_agent(agent, worktree, prompt, raw_path, clear_proxy_environment)
                     ended = now()
                     findings = load_review_findings(raw_path)
                     header = f"# PR Review: {repository} #{number}\n\n- **Repo name:** {repository}\n- **Author:** {author}\n- **PR number:** {number}\n- **Source branch:** {pr['headRefName']} ({pr['headRefOid']})\n- **Target branch:** {pr['baseRefName']} ({pr['baseRefOid']})\n- **Start time:** {started.strftime('%Y-%m-%d %H:%M:%S %z')}\n- **End time:** {ended.strftime('%Y-%m-%d %H:%M:%S %z')}\n- **Total time:** {duration(started, ended)}\n\n"
@@ -541,8 +622,8 @@ def main() -> int:
                             summary.append(f"#{number} reviewed; no eligible findings could be mapped to the current diff.")
                             send(f"[FINISHED] {repository} PR #{number} in {duration(started, ended)}; no eligible findings could be mapped to the current diff.", [report_path])
                     else:
-                        summary.append(f"#{number} reviewed")
-                        send(f"[FINISHED] {repository} PR #{number} in {duration(started, ended)}", [report_path])
+                        summary.append(f"#{number} reviewed ({finding_counts(findings)})")
+                        send(f"[FINISHED] {repository} PR #{number} in {duration(started, ended)} - {finding_counts(findings)}", [report_path])
                     state["prs"][key] = state_entry
                     save_json(state_path, state)
                 except Exception as error:

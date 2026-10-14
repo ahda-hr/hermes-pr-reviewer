@@ -40,7 +40,7 @@ class SetupTests(unittest.TestCase):
 
     def test_skill_selection_deduplicates_numbers(self):
         with patch.object(setup, "ask", return_value="2,1,2"):
-            self.assertEqual(setup.select_codex_skills(["review", "security"]), ["security", "review"])
+            self.assertEqual(setup.select_skills(["review", "security"]), ["security", "review"])
 
     def test_calendar_for_weekdays_and_every_day(self):
         self.assertEqual(setup.calendar_for("05:00", "weekdays"), "Mon..Fri *-*-* 05:00:00")

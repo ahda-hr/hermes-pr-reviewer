@@ -14,6 +14,11 @@
     "mode": "off"
   },
   "clearProxyEnvironment": false,
+  "agent": {
+    "_comment": "provider: codex or claude. model is optional. Claude examples: claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5, or aliases sonnet/opus/haiku. Codex examples (from the local Codex model list): gpt-6-luna, gpt-5.6-luna, gpt-5.6-terra. Omit model to use the CLI default.",
+    "provider": "claude",
+    "model": "claude-sonnet-5-5"
+  },
   "codexSkills": [],
-  "codexModel": "gpt-5.6-terra"
+  "claudeSkills": []
 }

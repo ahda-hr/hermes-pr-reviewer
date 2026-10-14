@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -60,6 +61,43 @@ class RunnerTests(unittest.TestCase):
 
     def test_configured_skills_are_unique(self):
         self.assertEqual(runner.configured_skill_names({"codexSkills": ["review", "review", "security"]}), ["review", "security"])
+
+    def test_agent_config_defaults_and_validation(self):
+        self.assertEqual(runner.agent_config({}), {"provider": "codex", "model": None})
+        self.assertEqual(runner.agent_config({"codexModel": "m"})["model"], "m")
+        self.assertEqual(runner.agent_config({"agent": {"provider": "claude", "model": "sonnet"}}), {"provider": "claude", "model": "sonnet"})
+        with self.assertRaisesRegex(RuntimeError, "provider"):
+            runner.agent_config({"agent": {"provider": "other"}})
+
+    def test_claude_skills_use_their_own_config_key_and_plain_names(self):
+        self.assertEqual(runner.configured_skill_names({"claudeSkills": ["review"], "codexSkills": ["x"]}, "claude"), ["review"])
+        prompt = runner.render_review_prompt("{{selected_skills}}", 1, "base", ["review"], "claude")
+        self.assertIn("Claude skills", prompt)
+        self.assertNotIn("$review", prompt)
+
+    def test_claude_agent_writes_unfenced_result(self):
+        envelope = json.dumps({"is_error": False, "result": "```json\n{\"findings\": []}\n```"})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runner, "command", return_value=envelope) as run:
+            raw = Path(tmp) / "raw.json"
+            runner.run_review_agent({"provider": "claude", "model": "sonnet"}, Path(tmp), "prompt", raw, False)
+            self.assertEqual(json.loads(raw.read_text()), {"findings": []})
+            self.assertEqual(run.call_args.args[0][0], "claude")
+            self.assertIn("sonnet", run.call_args.args[0])
+
+    def test_terminal_format_adds_stamp_tag_and_report_path(self):
+        out = runner.format_terminal("[FINISHED] o/r PR #1 in 2m - 1 important", [Path("/x/report.md")], stamp="12:00:00")
+        self.assertEqual(out.splitlines()[0], "12:00:00  FINISHED  o/r PR #1 in 2m - 1 important".replace("FINISHED  ", "FINISHED "))
+        self.assertIn("report: /x/report.md", out)
+        self.assertIn("\033[", runner.format_terminal("[FAILED] x", color=True))
+        self.assertNotIn("\033[", runner.format_terminal("[FAILED] x"))
+
+    def test_terminal_format_lists_summary_items(self):
+        out = runner.format_terminal("PR review completed: #1 reviewed; #2 failed: boom")
+        self.assertEqual(out.splitlines(), ["Done", "  - #1 reviewed", "  - #2 failed: boom"])
+
+    def test_finding_counts(self):
+        self.assertEqual(runner.finding_counts([]), "no findings")
+        self.assertEqual(runner.finding_counts([{"severity": "blocking"}, {"severity": "suggestion"}, {"severity": "suggestion"}]), "1 blocking, 2 suggestion(s)")
 
     def test_terminal_notifications_do_not_require_hermes(self):
         with patch.object(runner.shutil, "which", side_effect=lambda name: None if name == "hermes" else f"/{name}"):
